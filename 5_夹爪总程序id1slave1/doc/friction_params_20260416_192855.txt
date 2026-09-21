@@ -1,0 +1,42 @@
+================================================================================
+电机摩擦力参数识别结果 / Motor Friction Parameter Identification Results
+================================================================================
+
+测试信息 / Test Information:
+--------------------------------------------------
+测试时间 / Test Time: 2026-04-16T19:29:03.909712
+电机版本 / Motor Version: 51
+最大扭矩 / Max Torque: 10.0 N·m
+减速比 / Gear Ratio: 10.0
+
+摩擦参数结果 / Friction Parameter Results:
+--------------------------------------------------
+平均库仑摩擦力矩 / Average Coulomb Friction Torque: 0.387841 N·m
+  正向库仑摩擦 / Positive Direction: 0.654832 N·m
+  负向库仑摩擦 / Negative Direction: 0.120850 N·m
+
+平均静摩擦力矩 / Average Static Friction Torque: 0.037750 N·m
+  正向静摩擦 / Positive Direction: 0.037900 N·m
+  负向静摩擦 / Negative Direction: 0.037600 N·m
+
+已知参数 / Known Parameters:
+--------------------------------------------------
+粘滞摩擦系数 / Viscous Friction Coefficient: 0.0000465141 N·m·s/rad
+转子惯量 / Rotor Inertia: 0.0000081801 kg·m²
+
+库仑摩擦测试数据统计 / Coulomb Friction Test Data Statistics:
+--------------------------------------------------
+测试点数 / Number of Test Points: 17
+速度范围 / Velocity Range: -1.948 ~ 0.537 rad/s
+力矩范围 / Torque Range: -0.834368 ~ 1.617866 N·m
+
+文件说明 / File Description:
+--------------------------------------------------
+本文件包含了电机摩擦力参数自动识别的完整结果。
+This file contains the complete results of automatic motor friction parameter identification.
+
+库仑摩擦 (Coulomb Friction): 运动过程中的干摩擦力矩，与运动方向相反
+静摩擦 (Static Friction): 物体从静止开始运动时需要克服的最大摩擦力矩
+粘滞摩擦 (Viscous Friction): 与速度成正比的摩擦阻力
+
+================================================================================

@@ -1,0 +1,42 @@
+# Local Python environments and caches
+.conda/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Editor and workstation state
+.idea/
+.vscode/
+*.uvguix.*
+*.bak
+*.tmp
+Thumbs.db
+.DS_Store
+# Generated Keil intermediates (retain source, project settings, BIN/HEX firmware)
+*.o
+*.d
+*.crf
+*.dep
+*.lnp
+*.lst
+*.axf
+*.map
+*.build_log.htm
+*.log
+# Keep compiled reference images/reports required for firmware regression tests
+!matrix_validation/gripper1/*.axf
+!matrix_validation/gripper2/*.axf
+!matrix_validation/gripper1/*.map
+!matrix_validation/gripper2/*.map
+!matrix_validation/gripper1/build.log
+!matrix_validation/gripper2/build.log
+# Local recordings, calibration output, and pre-change backups
+**/PC_Tool/recordings/
+**/PC_Tool/friction_results/
+**/PC_Tool/*.settings.json
+/matrix_validation/*.zip
+# Local credentials
+.env
+.env.*
+!.env.example

@@ -1,0 +1,11 @@
+STM32G431夹爪ST-Link救援包
+Role: 1
+Version: 1.15.0
+Application: 0x08006000, 46968 bytes, CRC32=0xAEEE2162
+Bootloader: 0x08000000, 22536 bytes
+Metadata: 0x0801F000, 2048 bytes
+Calibration excluded: 0x0801F800~0x0801FFFF
+
+普通Application救援使用*_stlink_app_recovery.hex；
+Bootloader也损坏时使用*_stlink_full_recovery.hex。
+STM32CubeProgrammer必须启用扇区擦除和Verify，禁止Full Chip Erase。

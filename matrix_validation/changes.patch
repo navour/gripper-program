@@ -1,0 +1,2132 @@
+--- a/5_夹爪总程序id1slave1/User/Pressure_Sensor/Pressure_Sensor.c
++++ b/5_夹爪总程序id1slave1/User/Pressure_Sensor/Pressure_Sensor.c
+@@ -1,4 +1,5 @@
+ #include "Pressure_Sensor.h"
++#include "pressure_history.h"
+ #include "cmsis_os.h"
+ #include "Uart1_Print.h"
+ 
+@@ -499,6 +500,8 @@
+  */
+ void PressureSensor_UpdateAndPrint(void)
+ {
++    static uint32_t history_be_ms, history_le_ms;
++    PressureHistory_BeginCycle();
+     PressureFeat_t be_c = {0}, be_d = {0}, be_e = {0};
+     PressureFeat_t le_c = {0};
+     PressureFeat_t be_sum = {0};
+@@ -521,6 +524,7 @@
+ 
+     if (spi3_frame_ok)
+     {
++        history_be_ms = HAL_GetTick();
+         memcpy(sensor_data.BE_arrayC, SPI3_RxData + 129, 64);
+         memcpy(sensor_data.BE_arrayD, SPI3_RxData + 193, 64);
+         memcpy(sensor_data.BE_arrayE, SPI3_RxData + 257, 64);
+@@ -563,6 +567,7 @@
+ 
+     if (spi2_frame_ok)
+     {
++        history_le_ms = HAL_GetTick();
+         memcpy(sensor_data.LE_arrayC, SPI2_RxData + 129, 64);
+ 
+         Pressure_Process32(sensor_data.LE_arrayC, &g_le_c, &le_c);
+@@ -612,6 +617,13 @@
+                              (g_unlock_pending? PRESS_SAFE_FLAG_ARMING   : 0u));
+ 
+     // ==================== 通过 UART1 打印 ====================
++    /* Archive raw counts after the existing pressure safety calculation. */
++    PressureHistory_PushCycle(
++        sensor_data.BE_arrayC, sensor_data.BE_arrayD, sensor_data.BE_arrayE, sensor_data.LE_arrayC,
++        history_be_ms, history_le_ms,
++        (uint16_t)(spi3_frame_ok | (spi2_frame_ok << 1) | (s_have_be << 2) | (s_have_le << 3)),
++        (uint16_t)((g_be_c.calibrated << 0) | (g_be_d.calibrated << 1) | (g_be_e.calibrated << 2) | (g_le_c.calibrated << 3)));
++
+     Pressure_PublishFeature(PRESSURE_REGION_TOTAL,  &total);
+     Pressure_PublishFeature(PRESSURE_REGION_BE_SUM, &be_sum);
+     Pressure_PublishFeature(PRESSURE_REGION_BE_C,   &be_c);
+--- a/5_夹爪总程序id1slave1/User/Pressure_Sensor/pressure_history.c
++++ b/5_夹爪总程序id1slave1/User/Pressure_Sensor/pressure_history.c
+@@ -0,0 +1,170 @@
++#include "pressure_history.h"
++#include "main.h"
++#include <string.h>
++
++typedef struct {
++    uint32_t seq, be_ms, le_ms;
++    uint16_t flags, cal_mask, raw[MAT_RAW_WORDS];
++    uint32_t crc;
++} MatRecord;
++typedef char mat_record_size_check[(sizeof(MatRecord) == 276u) ? 1 : -1];
++
++static MatRecord queue[MAT_QUEUE_CAPACITY];
++static uint64_t session;
++static uint32_t produced, acknowledged, final_seq, drops;
++static uint16_t command[MAT_COMMAND_WORDS];
++static uint16_t device, layout_id, head, used, result, done_token;
++static uint8_t recording, stopped, overflow, busy, have_command, writing, readers;
++
++static uint32_t lock(void) { uint32_t p = __get_PRIMASK(); __disable_irq(); return p; }
++static void unlock(uint32_t p) { if (!p) __enable_irq(); }
++static uint32_t words32(const uint16_t *p) { return ((uint32_t)p[0] << 16) | p[1]; }
++static uint64_t command_session(void) {
++    return ((uint64_t)words32(command + 1) << 32) | words32(command + 3);
++}
++static void put32(uint16_t *p, uint32_t v) { p[0] = (uint16_t)(v >> 16); p[1] = (uint16_t)v; }
++static void put64(uint16_t *p, uint64_t v) { put32(p, (uint32_t)(v >> 32)); put32(p + 2, (uint32_t)v); }
++static uint32_t crc_byte(uint32_t c, uint8_t b) {
++    unsigned i;
++    c ^= b;
++    for (i = 0; i < 8u; ++i) c = (c >> 1) ^ ((c & 1u) ? 0xEDB88320u : 0u);
++    return c;
++}
++static uint32_t crc_word(uint32_t c, uint16_t w) {
++    return crc_byte(crc_byte(c, (uint8_t)(w >> 8)), (uint8_t)w);
++}
++static uint32_t record_crc(const MatRecord *r) {
++    uint16_t prefix[16];
++    uint32_t c = 0xFFFFFFFFu;
++    unsigned i;
++    prefix[0] = MAT_PROTOCOL_VER; prefix[1] = device; prefix[2] = layout_id;
++    put64(prefix + 3, session); put32(prefix + 7, r->seq);
++    put32(prefix + 9, r->be_ms); put32(prefix + 11, r->le_ms);
++    prefix[13] = r->flags; prefix[14] = r->cal_mask; prefix[15] = MAT_RAW_WORDS;
++    for (i = 0; i < 16u; ++i) c = crc_word(c, prefix[i]);
++    for (i = 0; i < MAT_RAW_WORDS; ++i) c = crc_word(c, r->raw[i]);
++    return c ^ 0xFFFFFFFFu;
++}
++
++void PressureHistory_Init(uint16_t slave, uint16_t layout) {
++    memset(queue, 0, sizeof(queue)); memset(command, 0, sizeof(command));
++    session = 0; produced = acknowledged = final_seq = drops = 0;
++    head = used = result = done_token = 0;
++    recording = stopped = overflow = busy = have_command = writing = readers = 0;
++    device = slave; layout_id = layout;
++}
++
++uint8_t PressureHistory_SubmitCommand(const uint16_t *words) {
++    uint32_t p = lock();
++    uint8_t error = 0;
++    if (busy) {
++        error = memcmp(words, command, sizeof(command)) ? 0x06u : 0u;
++    } else if (have_command && words[7] == command[7]) {
++        error = memcmp(words, command, sizeof(command)) ? 0x03u : 0u;
++    } else if (words[0] < MAT_START || words[0] > MAT_ACK_DURABLE ||
++               !(words[1] | words[2] | words[3] | words[4]) ||
++               (words[0] != MAT_ACK_DURABLE && (words[5] | words[6])) ||
++               (words[0] == MAT_ACK_DURABLE && !(words[5] | words[6]))) {
++        error = 0x03u;
++    } else {
++        memcpy(command, words, sizeof(command));
++        have_command = busy = 1u; result = 1u;
++    }
++    unlock(p);
++    return error;
++}
++
++/* Only short state transitions run with IRQs masked. No SPI, copying of raw
++ * frames, CRC computation, UART waits or storage operations in this section. */
++static void service(uint8_t boundary) {
++    uint32_t p = lock();
++    uint64_t requested;
++    uint32_t seq;
++    uint16_t rc = 0;
++    if (!busy || writing || readers ||
++        (!boundary && command[0] != MAT_ACK_DURABLE)) { unlock(p); return; }
++    requested = command_session(); seq = words32(command + 5);
++    if (command[0] == MAT_START) {
++        if (requested != session) {
++            if (recording || used) rc = 3u;
++            else {
++                session = requested; produced = acknowledged = final_seq = drops = 0;
++                head = 0; recording = 1u; stopped = overflow = 0;
++            }
++        }
++    } else if (requested != session) rc = 2u;
++    else if (command[0] == MAT_STOP) {
++        recording = 0; stopped = 1u; final_seq = produced;
++    } else if (seq <= acknowledged) {
++        /* Durable ACK retransmission: never pop a second frame. */
++    } else if (!used || queue[head].seq != seq) rc = 4u;
++    else {
++        acknowledged = seq; head = (uint16_t)((head + 1u) % MAT_QUEUE_CAPACITY); --used;
++    }
++    result = rc; done_token = command[7]; busy = 0;
++    unlock(p);
++}
++void PressureHistory_BeginCycle(void) { service(1u); }
++void PressureHistory_Service(void) { service(0u); }
++
++void PressureHistory_PushCycle(const uint16_t *r0, const uint16_t *r1,
++                              const uint16_t *r2, const uint16_t *r3,
++                              uint32_t be_ms, uint32_t le_ms,
++                              uint16_t flags, uint16_t cal_mask) {
++    MatRecord *r;
++    uint32_t p = lock();
++    if (!recording) { unlock(p); return; }
++    ++produced;
++    if (used == MAT_QUEUE_CAPACITY) {
++        ++drops; overflow = stopped = 1u; recording = 0; final_seq = produced;
++        unlock(p); return;
++    }
++    writing = 1u;
++    r = &queue[(head + used) % MAT_QUEUE_CAPACITY];
++    r->seq = produced;
++    unlock(p);
++    r->be_ms = be_ms; r->le_ms = le_ms;
++    r->flags = (uint16_t)((flags & 0x000Fu) | 0x8000u); r->cal_mask = cal_mask & 15u;
++    memcpy(r->raw, r0, 64u); memcpy(r->raw + 32, r1, 64u);
++    memcpy(r->raw + 64, r2, 64u); memcpy(r->raw + 96, r3, 64u);
++    r->crc = record_crc(r);
++    p = lock();
++    ++used; writing = 0;
++    if (produced == 0xFFFFFFFFu) { recording = 0; stopped = 1u; final_seq = produced; }
++    unlock(p);
++}
++
++void PressureHistory_ReadRegs(uint16_t start, uint16_t count, uint8_t *out) {
++    uint16_t state[32], header[16];
++    const MatRecord *r;
++    uint16_t i, value, addr;
++    uint32_t p;
++    if (start < MAT_REG_FIRST || start >= MAT_REG_END || count > MAT_REG_END - start) return;
++    memset(state, 0, sizeof(state)); memset(header, 0, sizeof(header));
++    p = lock();
++    ++readers;
++    r = used ? &queue[head] : 0;
++    state[0] = MAT_PROTOCOL_VER;
++    state[1] = (uint16_t)(recording | (used ? 2u : 0u) | (overflow ? 4u : 0u) |
++                          (stopped ? 8u : 0u) | (busy ? 16u : 0u));
++    state[2] = used; state[3] = MAT_QUEUE_CAPACITY;
++    put32(state + 4, produced); put32(state + 6, acknowledged);
++    put32(state + 8, final_seq); put32(state + 10, drops);
++    state[12] = layout_id; state[13] = MAT_RAW_WORDS;
++    state[14] = result; state[15] = done_token;
++    memcpy(state + 16, command, sizeof(command));
++    header[0] = MAT_PROTOCOL_VER; header[1] = layout_id; put64(header + 2, session);
++    unlock(p);
++    if (r) {
++        put32(header + 6, r->seq); put32(header + 8, r->be_ms); put32(header + 10, r->le_ms);
++        header[12] = r->flags; header[13] = r->cal_mask; put32(header + 14, r->crc);
++    }
++    for (i = 0; i < count; ++i) {
++        addr = start + i;
++        if (addr < MAT_REG_HEAD) value = state[addr - MAT_REG_FIRST];
++        else if (addr < MAT_REG_RAW) value = header[addr - MAT_REG_HEAD];
++        else value = r ? r->raw[addr - MAT_REG_RAW] : 0u;
++        out[2u*i] = (uint8_t)(value >> 8); out[2u*i + 1u] = (uint8_t)value;
++    }
++    p = lock(); --readers; unlock(p);
++}
+--- a/5_夹爪总程序id1slave1/User/Pressure_Sensor/pressure_history.h
++++ b/5_夹爪总程序id1slave1/User/Pressure_Sensor/pressure_history.h
+@@ -0,0 +1,30 @@
++#ifndef PRESSURE_HISTORY_H
++#define PRESSURE_HISTORY_H
++#include <stdint.h>
++
++#define MAT_REG_FIRST       0x0150u
++#define MAT_REG_COMMAND     0x0160u
++#define MAT_COMMAND_WORDS   8u
++#define MAT_REG_HEAD        0x0170u
++#define MAT_REG_RAW         0x0180u
++#define MAT_REG_END         0x0200u
++#define MAT_RAW_WORDS       128u
++#define MAT_QUEUE_CAPACITY  4u
++#define MAT_PROTOCOL_VER   1u
++#define MAT_START           1u
++#define MAT_STOP            2u
++#define MAT_ACK_DURABLE     3u
++
++/* Init before scheduling. BeginCycle and PushCycle: sole pressure producer.
++ * SubmitCommand: UART ISR; Service: communication task. ReadRegs outputs
++ * big-endian bytes and pins one head for the entire response range. */
++void PressureHistory_Init(uint16_t slave, uint16_t layout);
++void PressureHistory_BeginCycle(void);
++void PressureHistory_PushCycle(const uint16_t *r0, const uint16_t *r1,
++                              const uint16_t *r2, const uint16_t *r3,
++                              uint32_t be_ms, uint32_t le_ms,
++                              uint16_t flags, uint16_t cal_mask);
++uint8_t PressureHistory_SubmitCommand(const uint16_t words[MAT_COMMAND_WORDS]);
++void PressureHistory_Service(void);
++void PressureHistory_ReadRegs(uint16_t start, uint16_t count, uint8_t *out);
++#endif
+--- a/5_夹爪总程序id1slave1/User/Modbus/dm_modbus_bridge.c
++++ b/5_夹爪总程序id1slave1/User/Modbus/dm_modbus_bridge.c
+@@ -1,3 +1,4 @@
++#include "pressure_history.h"
+ #include "dm_modbus_bridge.h"
+ #include "dm_motor_ctrl.h"
+ #include "dm_motor_drv.h"
+@@ -696,7 +697,9 @@
+ }
+ 
+ static void bridge_service_uart_tx(uint32_t now_ms){
+-    if(s_tx_busy && ((now_ms - s_tx_started_ms) > 20u)){
++    uint32_t baud = s_huart->Init.BaudRate ? s_huart->Init.BaudRate : 115200u;
++    uint32_t tx_timeout_ms = ((uint32_t)s_txlen * 10000u + baud - 1u) / baud + 10u;
++    if(s_tx_busy && ((now_ms - s_tx_started_ms) > tx_timeout_ms)){
+         (void)HAL_UART_AbortTransmit_IT(s_huart);
+         s_tx_busy = 0u;
+         s_tx_pending = 0u;
+@@ -795,6 +798,8 @@
+ 
+ /* ------------------------ 只读寄存器保护 ------------------------ */
+ static uint8_t is_readonly_reg(uint16_t reg){
++    /* All history writes are handled by the dedicated atomic FC10 path. */
++    if(reg >= MAT_REG_FIRST && reg < MAT_REG_END) return 1;
+     /* 固定设备信息只读 */
+     if(reg == REG_DEV_ID || reg == REG_FW_VER) return 1;
+ 
+@@ -1409,6 +1414,7 @@
+     uint32_t now = HAL_GetTick();
+     estimator_sample_t estimator_sample;
+ 
++    PressureHistory_Service();
+     bridge_service_uart_tx(now);
+     bridge_ota_poll(now);
+     if(s_ota_reset_requested){
+@@ -1477,6 +1483,7 @@
+  */
+ void DM_Bridge_OnUartIdle(UART_HandleTypeDef *huart, uint16_t size){
+     if(huart != s_huart) return;
++    if(s_tx_busy || s_tx_pending) return;
+     s_rxlen = size;
+     (void)s_rxlen;
+ 
+@@ -1513,9 +1520,12 @@
+                 {
+                     uint16_t start = (uint16_t)((f[2] << 8) | f[3]);
+                     uint16_t count = (uint16_t)((f[4] << 8) | f[5]);
+-                    if(count == 0u ||
+-                       start >= (sizeof(s_regs)/sizeof(s_regs[0])) ||
+-                       count > ((sizeof(s_regs)/sizeof(s_regs[0])) - start)) count = 0;
++                    if(count == 0u || count > 125u || (5u + 2u * count) > TX_BUF_SZ){
++                        respond_exception(func, 0x03); return;
++                    }
++                    if(start >= 0x200u || count > (0x200u - start)){
++                        respond_exception(func, 0x02); return;
++                    }
+ 
+                     s_txbuf[0] = BRIDGE_SLAVE_ADDR;
+                     s_txbuf[1] = 0x03;
+@@ -1527,6 +1537,13 @@
+                             s_txbuf[3 + 2*i]     = (uint8_t)(v >> 8);
+                             s_txbuf[3 + 2*i + 1] = (uint8_t)(v & 0xFF);
+                         }
++                    }
++                    /* One pinned history snapshot for the whole response, including
++                     * requests crossing from legacy registers into the new range. */
++                    if(start + count > MAT_REG_FIRST){
++                        uint16_t first = start < MAT_REG_FIRST ? MAT_REG_FIRST : start;
++                        PressureHistory_ReadRegs(first, (uint16_t)(start + count - first),
++                                                 s_txbuf + 3u + 2u * (first - start));
+                     }
+                     txlen = (uint16_t)(3 + count*2);
+                 }
+@@ -1668,6 +1685,21 @@
+                         return;
+                     }
+ 
++                    if(start + count > MAT_REG_FIRST){
++                        uint16_t words[MAT_COMMAND_WORDS];
++                        uint8_t error;
++                        if(start != MAT_REG_COMMAND || count != MAT_COMMAND_WORDS ||
++                           bytecnt != 16u || framelen != 25u){
++                            respond_exception(func, 0x02); return;
++                        }
++                        for(i = 0; i < MAT_COMMAND_WORDS; ++i)
++                            words[i] = (uint16_t)(((uint16_t)f[7 + 2*i] << 8) | f[8 + 2*i]);
++                        error = PressureHistory_SubmitCommand(words);
++                        if(error){ respond_exception(func, error); return; }
++                        memcpy(s_txbuf, f, 6u); txlen = 6u;
++                        goto done;
++                    }
++
+                     /* OTA authorization must use three ordered 0x06 writes. */
+                     if(start <= REG_OTA_CTRL && (start + count) > REG_OTA_KEY1){
+                         respond_exception(func, 0x03);
+--- a/5_夹爪总程序id1slave1/Core/Src/app_freertos.c
++++ b/5_夹爪总程序id1slave1/Core/Src/app_freertos.c
+@@ -25,6 +25,7 @@
+ 
+ /* Private includes ----------------------------------------------------------*/
+ /* USER CODE BEGIN Includes */
++#include "pressure_history.h"
+ #include "AS5048A.h"
+ #include "bsp_fdcan.h"
+ #include "dm_motor_ctrl.h"
+@@ -129,6 +130,7 @@
+   */
+ void MX_FREERTOS_Init(void) {
+   /* USER CODE BEGIN Init */
++  PressureHistory_Init(1u, 1u);
+ 
+   /* USER CODE END Init */
+ 
+--- a/5_夹爪总程序id1slave1/MDK-ARM/JIAZHUA_RTOS.uvprojx
++++ b/5_夹爪总程序id1slave1/MDK-ARM/JIAZHUA_RTOS.uvprojx
+@@ -883,6 +883,11 @@
+               <FileType>1</FileType>
+               <FilePath>..\User\Pressure_Sensor\Pressure_Sensor.c</FilePath>
+             </File>
++            <File>
++              <FileName>pressure_history.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>..\User\Pressure_Sensor\pressure_history.c</FilePath>
++            </File>
+           </Files>
+         </Group>
+         <Group>
+--- a/5_夹爪总程序id1slave1/PC_Tool/3_gripper.py
++++ b/5_夹爪总程序id1slave1/PC_Tool/3_gripper.py
+@@ -395,6 +395,9 @@
+             row=1, column=0, columnspan=11, padx=4, pady=(4, 0), sticky="ew"
+         )
+ 
++        from tactile_ui import TactilePanel
++        self.tactile = TactilePanel(self, conn)
++
+         quick = ttk.LabelFrame(frm, text="常用指令", padding=8)
+         quick.grid(row=1, column=0, sticky="ew", pady=8)
+         for i in range(12):
+@@ -595,6 +598,10 @@
+             messagebox.showerror("连接失败", str(exc))
+ 
+     def disconnect(self):
++        if self.tactile.active.is_set():
++            self.tactile.stop.set()
++            self.log("Please wait for matrix STOP/drain before disconnecting.")
++            return
+         self._stop_safe_poll()
+         if self.ser:
+             try:
+@@ -618,6 +625,10 @@
+             pass
+ 
+     def _send_and_recv(self, req: bytes, quiet: bool = False) -> bytes | None:
++        if (self.tactile.active.is_set() and len(req) >= 6 and req[1] in (6, 16)
++                and int.from_bytes(req[2:4], "big") + (int.from_bytes(req[4:6], "big") if req[1] == 16 else 1) > 0x150):
++            self.log("Matrix registers are owned by the recorder during capture.")
++            return None
+         if not self.ser:
+             if not quiet:
+                 messagebox.showwarning("提示", "请先连接串口")
+@@ -629,6 +640,7 @@
+         self.manual_io_pending.set()
+         try:
+             with self.rx_lock:
++                time.sleep(0.00175)
+                 serial_timeout = self.ser.timeout
+                 self.ser.reset_input_buffer()
+                 self.ser.write(req)
+--- a/5_夹爪总程序id1slave1/PC_Tool/tactile_protocol.py
++++ b/5_夹爪总程序id1slave1/PC_Tool/tactile_protocol.py
+@@ -0,0 +1,230 @@
++"""Matrix protocol v1. All Modbus addresses are zero based."""
++from dataclasses import dataclass
++import struct
++import time
++import zlib
++
++STATUS, COMMAND, HEAD, SECOND = 0x150, 0x160, 0x170, 0x1C0
++START, STOP, ACK = 1, 2, 3
++LAYOUTS = {1: ('BE_C', 'BE_D', 'BE_E', 'LE_C'), 2: ('BE_B', 'BE_C', 'BE_E', 'LE_C')}
++PREFIX = struct.Struct('>HHHQIIIHHH')
++
++class ProtocolError(RuntimeError):
++    pass
++
++class ModbusError(ProtocolError):
++    def __init__(self, code):
++        self.code = code
++        super().__init__(f'Modbus exception 0x{code:02X}')
++
++def crc16(data):
++    c = 0xFFFF
++    for b in data:
++        c ^= b
++        for _ in range(8):
++            c = (c >> 1) ^ (0xA001 if c & 1 else 0)
++    return c
++
++def packet(data):
++    return data + struct.pack('<H', crc16(data))
++
++def u32(words):
++    return (words[0] << 16) | words[1]
++
++def u64(words):
++    return (u32(words[:2]) << 32) | u32(words[2:4])
++
++@dataclass(frozen=True)
++class Frame:
++    slave: int
++    layout: int
++    session: int
++    sequence: int
++    be_ms: int
++    le_ms: int
++    flags: int
++    cal_mask: int
++    raw: tuple
++    crc: int
++    version: int = 1
++
++    def payload(self):
++        return PREFIX.pack(self.version, self.slave, self.layout, self.session,
++                           self.sequence, self.be_ms, self.le_ms, self.flags,
++                           self.cal_mask, 128) + struct.pack('>128H', *self.raw)
++
++    def validate(self):
++        if (self.version != 1 or self.slave not in (1, 2) or self.layout != self.slave or
++                not self.session or not self.sequence or len(self.raw) != 128 or
++                not self.flags & 0x8000 or self.flags & ~0x800F or self.cal_mask & ~15):
++            raise ProtocolError('Invalid frame identity, version, flags or layout')
++        if zlib.crc32(self.payload()) != self.crc:
++            raise ProtocolError('Whole-record CRC32 mismatch')
++        return self
++
++    @classmethod
++    def from_payload(cls, payload, crc):
++        if len(payload) != 288:
++            raise ProtocolError('Expected 288 canonical bytes')
++        ver, slave, layout, session, seq, be, le, flags, cal, count = PREFIX.unpack(payload[:32])
++        if count != 128:
++            raise ProtocolError('Invalid matrix size')
++        return cls(slave, layout, session, seq, be, le, flags, cal,
++                   struct.unpack('>128H', payload[32:]), crc, ver).validate()
++
++    @classmethod
++    def from_registers(cls, slave, first, second):
++        if len(first) != 80 or len(second) != 64:
++            raise ProtocolError('Incomplete matrix halves')
++        return cls(slave, first[1], u64(first[2:6]), u32(first[6:8]),
++                   u32(first[8:10]), u32(first[10:12]), first[12], first[13],
++                   tuple(first[16:] + second), u32(first[14:16]), first[0]).validate()
++
++@dataclass(frozen=True)
++class Status:
++    flags: int
++    count: int
++    capacity: int
++    produced: int
++    acknowledged: int
++    final: int
++    drops: int
++    layout: int
++    result: int
++    done_token: int
++
++    @classmethod
++    def parse(cls, r):
++        if len(r) != 16 or r[0] != 1 or r[13] != 128:
++            raise ProtocolError('Matrix protocol is unavailable or incompatible')
++        return cls(r[1], r[2], r[3], u32(r[4:6]), u32(r[6:8]),
++                   u32(r[8:10]), u32(r[10:12]), r[12], r[14], r[15])
++
++class SerialTransport:
++    """Caller serializes every transaction with controls on the SAME bus lock."""
++    def __init__(self, serial_port, timeout=0.15):
++        self.serial = serial_port
++        self.timeout = timeout
++        self.last_end = 0.0
++
++    def __call__(self, request):
++        s = self.serial
++        time.sleep(max(0, 0.00175 - (time.monotonic() - self.last_end)))
++        old = s.timeout
++        try:
++            s.timeout = min(0.01, self.timeout)
++            s.reset_input_buffer()
++            s.write(request)
++            s.flush()
++            deadline = time.monotonic() + self.timeout
++            buf = bytearray()
++            while time.monotonic() < deadline:
++                buf.extend(s.read(1))
++                if len(buf) >= 3:
++                    length = 5 if buf[1] & 0x80 else (5 + buf[2] if buf[1] == 3 else 8)
++                    if len(buf) == length:
++                        return bytes(buf)
++            raise TimeoutError('RS485 response timeout')
++        finally:
++            s.timeout = old
++            self.last_end = time.monotonic()
++
++class MatrixClient:
++    """One command in flight per gripper; transaction callback may yield to controls."""
++    def __init__(self, exchange, slave):
++        if slave not in (1, 2):
++            raise ValueError('slave must be 1 or 2')
++        self.exchange, self.slave = exchange, slave
++        self.token = None
++        self.prefetched = None
++
++    def _request(self, body):
++        response = self.exchange(packet(bytes([self.slave]) + body))
++        if not response or len(response) < 5 or crc16(response[:-2]) != int.from_bytes(response[-2:], 'little'):
++            raise ProtocolError('Missing or corrupt Modbus response')
++        if response[0] != self.slave:
++            raise ProtocolError('Wrong slave')
++        if response[1] == body[0] | 0x80:
++            raise ModbusError(response[2])
++        if response[1] != body[0]:
++            raise ProtocolError('Wrong function')
++        return response
++
++    def read(self, address, count):
++        for attempt in range(3):
++            try:
++                r = self._request(struct.pack('>BHH', 3, address, count))
++                if len(r) != 5 + 2 * count or r[2] != 2 * count:
++                    raise ProtocolError('Wrong register count')
++                return list(struct.unpack(f'>{count}H', r[3:-2]))
++            except ModbusError:
++                raise
++            except (TimeoutError, ProtocolError):
++                if attempt == 2:
++                    raise
++                time.sleep(0.001)
++
++    def status(self):
++        s = Status.parse(self.read(STATUS, 16))
++        if s.layout != self.slave:
++            raise ProtocolError('Wrong device layout')
++        return s
++
++    def session(self):
++        return u64(self.read(HEAD + 2, 4))
++
++    def frame(self):
++        first, self.prefetched = self.prefetched, None
++        if first is None:
++            first = self.read(HEAD, 80)
++        if not first[12] & 0x8000:
++            return None
++        return Frame.from_registers(self.slave, first, self.read(SECOND, 64))
++
++    def command(self, opcode, session, sequence=0, timeout=2.0):
++        if self.token is None:
++            self.token = (self.read(COMMAND, 8)[7] + 1) & 0xFFFF
++        token = self.token
++        words = [opcode, *struct.unpack('>4H', struct.pack('>Q', session)),
++                 sequence >> 16, sequence & 0xFFFF, token]
++        body = struct.pack('>BHHB8H', 16, COMMAND, 8, 16, *words)
++        deadline, accepted, last_error = time.monotonic() + timeout, False, None
++        while time.monotonic() < deadline:
++            try:
++                if not accepted:
++                    r = self._request(body)
++                    if r[2:6] != struct.pack('>HH', COMMAND, 8) or len(r) != 8:
++                        raise ProtocolError('Wrong command echo')
++                    accepted = True
++                # Fast ACK completion: only a durable ACK can advance this head.
++                if opcode == ACK:
++                    first = self.read(HEAD, 80)
++                    if u64(first[2:6]) != session:
++                        raise RuntimeError('Gripper reset or session changed during ACK')
++                    if first[12] & 0x8000 and u32(first[6:8]) > sequence:
++                        self.prefetched = first
++                        self.token = (token + 1) & 0xFFFF
++                        return None
++                s = self.status()
++                if not s.flags & 16 and s.done_token == token:
++                    if s.result:
++                        raise RuntimeError(f'Matrix command rejected: result={s.result}')
++                    if opcode != ACK and self.session() != session:
++                        raise RuntimeError('Command result belongs to a different session')
++                    valid = ((opcode == START and bool(s.flags & 1)) or
++                             (opcode == STOP and bool(s.flags & 8) and not s.flags & 1) or
++                             (opcode == ACK and s.acknowledged >= sequence))
++                    if not valid:
++                        raise RuntimeError('Command result has unexpected state')
++                    self.token = (token + 1) & 0xFFFF
++                    return s
++            except ModbusError as exc:
++                if exc.code != 6:
++                    raise
++                last_error, accepted = exc, False
++            except (TimeoutError, ProtocolError) as exc:
++                last_error, accepted = exc, False
++            time.sleep(0.001)
++        # The caller must stop/reconnect after an ambiguous completion. Never send
++        # different parameters using this token, and never silently create a session.
++        raise TimeoutError(f'Command completion unknown; reconnect to recover: {last_error}')
+--- a/5_夹爪总程序id1slave1/PC_Tool/tactile_recorder.py
++++ b/5_夹爪总程序id1slave1/PC_Tool/tactile_recorder.py
+@@ -0,0 +1,300 @@
++"""Durable SQLite WAL journal, background HDF5 export, USB recording CLI.
++
++The .wal.sqlite sidecar is the recovery source and is deliberately retained.
++ACK is permitted only after SQLite synchronous=FULL commit returns.
++"""
++import argparse
++from contextlib import closing
++import json
++import os
++from pathlib import Path
++import sqlite3
++import struct
++import threading
++import time
++
++from tactile_protocol import MatrixClient, Frame, LAYOUTS, START, STOP, ACK
++
++class Recorder:
++    def __init__(self, output):
++        # Import before starting a device session; fail early if dependencies missing.
++        import h5py
++        import numpy
++        self.path = Path(output).resolve()
++        self.db_path = Path(str(self.path) + '.wal.sqlite')
++        self.partial = Path(str(self.path) + '.partial.h5')
++        if self.path.exists() and not self.db_path.exists():
++            raise FileExistsError('Existing HDF5 has no matching journal; choose a new path')
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self.lockfile = open(str(self.db_path) + '.lock', 'a+b')
++        self.lockfile.seek(0)
++        if os.name == 'nt':
++            import msvcrt
++            try:
++                msvcrt.locking(self.lockfile.fileno(), msvcrt.LK_NBLCK, 1)
++            except OSError:
++                self.lockfile.close()
++                raise RuntimeError('Recording file is in use by another process')
++        else:
++            import fcntl
++            fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        self.db = sqlite3.connect(self.db_path)
++        self.db.execute('PRAGMA journal_mode=WAL')
++        self.db.execute('PRAGMA synchronous=FULL')
++        self.db.executescript('''
++          CREATE TABLE IF NOT EXISTS sessions (
++            slave INTEGER NOT NULL, session TEXT NOT NULL, final INTEGER,
++            drops INTEGER, acknowledged INTEGER, complete INTEGER NOT NULL DEFAULT 0,
++            PRIMARY KEY(slave,session));
++          CREATE TABLE IF NOT EXISTS frames (
++            id INTEGER PRIMARY KEY, slave INTEGER NOT NULL, session TEXT NOT NULL,
++            sequence INTEGER NOT NULL, payload BLOB NOT NULL, crc INTEGER NOT NULL,
++            received_ns INTEGER NOT NULL, UNIQUE(slave,session,sequence));
++        ''')
++        self.db.commit()
++        self.error = None
++        self.finished = threading.Event()
++        self.thread = threading.Thread(target=self._export, name='tactile-hdf5', daemon=True)
++        self.thread.start()
++        self.closed = False
++
++    def check(self):
++        if self.error:
++            raise RuntimeError(f'HDF5 writer failed; journal retained: {self.error}') from self.error
++
++    def start_session(self, slave):
++        self.check()
++        # time_ns is a nonzero 64-bit identifier. Monotonic within this persistent journal.
++        allocator = Path(os.environ.get('TACTILE_SESSION_DB', str(Path.home() / '.gripper_tactile_sessions.sqlite')))
++        allocator.parent.mkdir(parents=True, exist_ok=True)
++        with closing(sqlite3.connect(allocator, timeout=5)) as ids:
++            ids.execute('PRAGMA synchronous=FULL')
++            ids.execute('CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)')
++            ids.execute('BEGIN IMMEDIATE')
++            row = ids.execute('SELECT value FROM counter WHERE id=1').fetchone()
++            last = int(row[0],16) if row else 0
++            session = max(time.time_ns(), last+1)
++            ids.execute('INSERT OR REPLACE INTO counter VALUES (1,?)',(f'{session:016x}',))
++            ids.commit()
++        if session >= 2**64:
++            raise OverflowError('Session identifier exhausted')
++        with self.db:
++            self.db.execute('INSERT INTO sessions(slave,session) VALUES (?,?)', (slave, f'{session:016x}'))
++        return session
++
++    def has_session(self, slave, session):
++        return self.db.execute('SELECT 1 FROM sessions WHERE slave=? AND session=?',
++                               (slave, f'{session:016x}')).fetchone() is not None
++
++    def last_sequence(self, slave, session):
++        return self.db.execute('SELECT COALESCE(MAX(sequence),0) FROM frames WHERE slave=? AND session=?',
++                               (slave, f'{session:016x}')).fetchone()[0]
++
++    def append(self, frame):
++        self.check()
++        frame.validate()
++        key = (frame.slave, f'{frame.session:016x}', frame.sequence)
++        if not self.has_session(frame.slave, frame.session):
++            raise RuntimeError('Unknown session; refusing to claim a complete recording')
++        old = self.db.execute('SELECT payload,crc FROM frames WHERE slave=? AND session=? AND sequence=?', key).fetchone()
++        if old:
++            if old != (frame.payload(), frame.crc):
++                raise RuntimeError('Same frame identity has different contents')
++            return False
++        expected = self.last_sequence(frame.slave, frame.session) + 1
++        if frame.sequence != expected:
++            raise RuntimeError(f'Missing matrix: expected {expected}, received {frame.sequence}')
++        with self.db:
++            self.db.execute('INSERT INTO frames(slave,session,sequence,payload,crc,received_ns) VALUES (?,?,?,?,?,?)',
++                            (*key, frame.payload(), frame.crc, time.time_ns()))
++        # Only after successful FULL synchronous commit may caller send ACK.
++        return True
++
++    def finish_session(self, slave, session, status):
++        last = self.last_sequence(slave, session)
++        complete = (not status.flags & (1 | 4 | 16) and bool(status.flags & 8) and
++                    status.count == 0 and status.drops == 0 and
++                    last == status.acknowledged == status.final == status.produced)
++        with self.db:
++            self.db.execute('UPDATE sessions SET final=?,drops=?,acknowledged=?,complete=? WHERE slave=? AND session=?',
++                            (status.final, status.drops, status.acknowledged, int(complete), slave, f'{session:016x}'))
++        return complete
++
++    def _export(self):
++        import h5py
++        import numpy as np
++        db = None
++        try:
++            db = sqlite3.connect(self.db_path)
++            last_id = 0
++            with h5py.File(self.partial, 'w') as h:
++                meta = h.create_group('metadata')
++                meta.attrs['protocol_version'] = 1
++                meta.attrs['units'] = 'raw_sensor_counts'
++                meta.attrs['time_basis'] = 'be_ms/le_ms: MCU uint32 milliseconds; receive_time: Unix nanoseconds'
++                meta.attrs['recovery_journal'] = self.db_path.name
++                groups = {}
++                while True:
++                    rows = db.execute('SELECT id,payload,crc,received_ns FROM frames WHERE id>? ORDER BY id LIMIT 128', (last_id,)).fetchall()
++                    for rowid, payload, crc, received in rows:
++                        f = Frame.from_payload(payload, crc)
++                        name = f'gripper{f.slave}/{f.session:016x}'
++                        if name not in groups:
++                            g = h.require_group(name)
++                            g.attrs['regions'] = json.dumps(LAYOUTS[f.layout])
++                            g.attrs['layout_id'] = f.layout
++                            g.attrs['session_id'] = np.uint64(f.session)
++                            g.attrs['complete'] = False
++                            g.create_dataset('raw', (0,4,8,4), maxshape=(None,4,8,4), dtype='uint16', chunks=(64,4,8,4), compression='lzf', fletcher32=True)
++                            for field,dtype in [('sequence','uint32'),('be_ms','uint32'),('le_ms','uint32'),('receive_time','int64'),('sample_flags','uint16'),('cal_mask','uint16'),('crc32','uint32')]:
++                                g.create_dataset(field, (0,), maxshape=(None,), dtype=dtype, chunks=(256,), fletcher32=True)
++                            groups[name] = g
++                        g = groups[name]
++                        index = len(g['sequence'])
++                        values = dict(raw=np.asarray(f.raw,dtype='uint16').reshape(4,8,4), sequence=f.sequence,
++                                      be_ms=f.be_ms, le_ms=f.le_ms, receive_time=received,
++                                      sample_flags=f.flags, cal_mask=f.cal_mask, crc32=f.crc)
++                        for field,value in values.items():
++                            ds = g[field]
++                            ds.resize(index+1, axis=0)
++                            ds[index] = value
++                        last_id = rowid
++                    for slave,session,final,drops,ack,complete in db.execute('SELECT * FROM sessions'):
++                        g = h.require_group(f'gripper{slave}/{session}')
++                        g.attrs['complete'] = bool(complete)
++                        if final is not None:
++                            g.attrs['final_sequence'] = final
++                            g.attrs['drop_count'] = drops
++                            g.attrs['acknowledged'] = ack
++                    h.flush()
++                    if self.finished.is_set() and not rows:
++                        break
++                    self.finished.wait(0.05)
++            # Closed HDF5 is flushed through the OS. Journal remains for recovery.
++            with open(self.partial, 'r+b') as f:
++                os.fsync(f.fileno())
++            verify_h5(self.partial)
++            os.replace(self.partial, self.path)
++        except BaseException as exc:
++            self.error = exc
++        finally:
++            if db is not None:
++                db.close()
++
++    def close(self):
++        if self.closed:
++            return
++        self.closed = True
++        self.finished.set()
++        self.thread.join()
++        self.db.close()
++        self.lockfile.close()
++        self.check()
++
++
++def verify_h5(path):
++    import h5py
++    report = {}
++    with h5py.File(path, 'r') as h:
++        for slave in (1,2):
++            root = h.get(f'gripper{slave}')
++            if root is None:
++                continue
++            for session,g in root.items():
++                n = len(g['sequence']) if 'sequence' in g else 0
++                if n:
++                    if g['raw'].shape != (n,4,8,4) or any(len(g[k]) != n for k in ('be_ms','le_ms','receive_time','sample_flags','cal_mask','crc32')):
++                        raise RuntimeError('HDF5 dataset length mismatch')
++                    for i in range(n):
++                        f = Frame(slave,int(g.attrs['layout_id']),int(session,16),int(g['sequence'][i]),
++                                  int(g['be_ms'][i]),int(g['le_ms'][i]),int(g['sample_flags'][i]),int(g['cal_mask'][i]),
++                                  tuple(int(x) for x in g['raw'][i].flat),int(g['crc32'][i]))
++                        f.validate()
++                        if f.sequence != i+1:
++                            raise RuntimeError('HDF5 sequence gap/duplicate')
++                if g.attrs.get('complete',False) and (n != g.attrs.get('final_sequence',-1) or g.attrs.get('drop_count',-1) != 0 or n != g.attrs.get('acknowledged',-1)):
++                    raise RuntimeError('HDF5 completion assertion is inconsistent')
++                report[f'gripper{slave}/{session}'] = {'frames': n, 'complete': bool(g.attrs.get('complete',False))}
++    return report
++
++
++def capture(client, recorder, stop_event, resume=False, seconds=None, notify=print):
++    status = client.status()
++    session = client.session()
++    if resume:
++        if not session or not recorder.has_session(client.slave, session):
++            raise RuntimeError('Resume needs the original journal and a surviving gripper session')
++        if recorder.last_sequence(client.slave, session) < status.acknowledged:
++            raise RuntimeError('Journal is missing data already released by the gripper')
++    else:
++        if status.count or status.flags & 1:
++            raise RuntimeError('Existing gripper session must be recovered first (--resume)')
++        session = recorder.start_session(client.slave)
++        client.command(START, session)
++    notify(f'Session {session:016x}; slave {client.slave}')
++    began, stopping, next_status, frames = time.monotonic(), False, 0.0, 0
++    while True:
++        recorder.check()
++        if not stopping and (stop_event.is_set() or (seconds is not None and time.monotonic()-began >= seconds)):
++            client.command(STOP, session)
++            stopping = True
++        frame = client.frame()
++        if frame is not None:
++            if frame.session != session:
++                raise RuntimeError('Gripper session changed; recording is incomplete')
++            recorder.append(frame)
++            client.command(ACK, session, frame.sequence)
++            frames += 1
++            if frames % 100 == 0:
++                notify(f'Archived sequence {frame.sequence}')
++        else:
++            time.sleep(0.002)
++        now = time.monotonic()
++        if now >= next_status or (stopping and frame is None):
++            status = client.status()
++            if client.session() != session:
++                raise RuntimeError('Gripper reset; recording is incomplete')
++            next_status = now + 1.0
++            if status.flags & 8:
++                stopping = True
++            if stopping and not status.count:
++                complete = recorder.finish_session(client.slave, session, status)
++                notify(f'Finished: complete={complete}, final={status.final}, drops={status.drops}')
++                if not complete:
++                    raise RuntimeError('Recording incomplete: overflow, sequence gap or missing ACK')
++                return
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--output', required=True, help='HDF5 output and journal basename')
++    p.add_argument('--port')
++    p.add_argument('--slave',type=int,choices=(1,2),default=1)
++    p.add_argument('--baud',type=int,default=115200)
++    p.add_argument('--seconds',type=float,default=10.0)
++    p.add_argument('--resume',action='store_true')
++    p.add_argument('--recover',action='store_true',help='Rebuild HDF5 from retained journal without hardware')
++    p.add_argument('--verify',action='store_true')
++    a = p.parse_args()
++    if a.verify:
++        print(json.dumps(verify_h5(a.output),indent=2)); return
++    if a.recover and not Path(a.output+'.wal.sqlite').exists():
++        p.error('Recovery journal does not exist')
++    if not a.recover and not a.port:
++        p.error('--port is required for USB capture')
++    recorder = Recorder(a.output)
++    try:
++        if not a.recover:
++            import serial
++            import signal
++            from tactile_protocol import SerialTransport
++            stop = threading.Event()
++            signal.signal(signal.SIGINT,lambda *_: stop.set())
++            with serial.Serial(a.port,a.baud,timeout=0.15,write_timeout=0.5) as s:
++                capture(MatrixClient(SerialTransport(s),a.slave),recorder,stop,a.resume,a.seconds)
++    finally:
++        recorder.close()
++    print(json.dumps(verify_h5(a.output),indent=2))
++
++if __name__ == '__main__':
++    main()
+--- a/5_夹爪总程序id1slave1/PC_Tool/tactile_ui.py
++++ b/5_夹爪总程序id1slave1/PC_Tool/tactile_ui.py
+@@ -0,0 +1,99 @@
++"""Tk integration: one existing serial port and transaction lock, manual controls first."""
++import queue
++import threading
++import time
++from tkinter import filedialog, ttk, messagebox
++
++class TactilePanel:
++    def __init__(self, app, parent):
++        self.app = app
++        self.active = threading.Event()
++        self.stop = threading.Event()
++        self.messages = queue.Queue()
++        self.closing = False
++        ttk.Button(parent,text='开始矩阵录制',command=self.start).grid(row=2,column=0,columnspan=2,pady=4)
++        ttk.Button(parent,text='恢复录制',command=lambda:self.start(True)).grid(row=2,column=2,pady=4)
++        ttk.Button(parent,text='停止并保存 H5',command=self.stop.set).grid(row=2,column=3,columnspan=2,pady=4)
++        self.label = ttk.Label(parent,text='矩阵: 未录制')
++        self.label.grid(row=2,column=5,columnspan=6,sticky='w')
++        app.root.after(100,self._poll)
++        app.root.protocol('WM_DELETE_WINDOW',self.close_window)
++
++    def start(self,resume=False):
++        if self.active.is_set():
++            return
++        if not self.app.ser:
++            messagebox.showwarning('矩阵录制','请先连接夹爪串口'); return
++        if resume:
++            journal = filedialog.askopenfilename(title='选择原录制日志',filetypes=[('恢复日志','*.wal.sqlite')])
++            if not journal: return
++            path = journal[:-len('.wal.sqlite')]
++        else:
++            path = filedialog.asksaveasfilename(title='保存矩阵数据',defaultextension='.h5',filetypes=[('HDF5','*.h5')])
++            if not path: return
++        try:
++            slave = self.app._slave()
++            if slave not in (1,2): raise ValueError('Slave 必须为 1 或 2')
++            import h5py, numpy
++        except Exception as exc:
++            messagebox.showerror('矩阵录制',str(exc)); return
++        self.stop.clear(); self.active.set()
++        self.label.configure(text='矩阵: 准备录制')
++        serial_port = self.app.ser
++        threading.Thread(target=self._worker,args=(serial_port,slave,path,resume),daemon=True).start()
++
++    def _worker(self,serial_port,slave,path,resume):
++        from tactile_protocol import MatrixClient, SerialTransport
++        from tactile_recorder import Recorder,capture
++        transport = SerialTransport(serial_port)
++        def exchange(request):
++            deadline = time.monotonic()+2
++            while True:
++                if not self.app.manual_io_pending.is_set() and self.app.rx_lock.acquire(timeout=0.005):
++                    if self.app.manual_io_pending.is_set():
++                        self.app.rx_lock.release()
++                    else:
++                        try:
++                            time.sleep(0.00175)
++                            return transport(request)
++                        finally:
++                            self.app.rx_lock.release()
++                if time.monotonic()>deadline:
++                    raise TimeoutError('控制指令持续占用总线，矩阵录制无法获得服务')
++                time.sleep(0.001)
++        recorder = None
++        try:
++            recorder = Recorder(path)
++            capture(MatrixClient(exchange,slave),recorder,self.stop,resume,notify=self.messages.put)
++            self.messages.put('采集结束，正在核验 HDF5')
++        except Exception as exc:
++            self.messages.put(f'录制未完整完成: {exc}；保留日志后可恢复')
++        finally:
++            if recorder is not None:
++                try:
++                    recorder.close()
++                    self.messages.put(f'HDF5 已生成: {path}（完整性见 complete 属性）')
++                except Exception as exc:
++                    self.messages.put(f'保存失败: {exc}')
++            self.messages.put(None)
++
++    def _poll(self):
++        try:
++            while True:
++                text = self.messages.get_nowait()
++                if text is None:
++                    self.active.clear()
++                else:
++                    self.label.configure(text=text)
++                    self.app.log(text)
++        except queue.Empty:
++            pass
++        if self.closing and not self.active.is_set():
++            self.app.disconnect(); self.app.root.destroy(); return
++        self.app.root.after(100,self._poll)
++
++    def close_window(self):
++        self.closing = True
++        self.stop.set()
++        if self.active.is_set():
++            self.label.configure(text='矩阵: 停止并保存后关闭窗口')
+--- a/5_夹爪总程序id1slave1/PC_Tool/requirements-tactile.txt
++++ b/5_夹爪总程序id1slave1/PC_Tool/requirements-tactile.txt
+@@ -0,0 +1,3 @@
++pyserial>=3.5
++numpy>=1.24
++h5py>=3.8
+--- a/5_夹爪总程序id2slave2/User/Pressure_Sensor/Pressure_Sensor.c
++++ b/5_夹爪总程序id2slave2/User/Pressure_Sensor/Pressure_Sensor.c
+@@ -1,4 +1,5 @@
+ #include "Pressure_Sensor.h"
++#include "pressure_history.h"
+ #include "cmsis_os.h"
+ #include "Uart1_Print.h"
+ 
+@@ -579,6 +580,8 @@
+  */
+ void PressureSensor_UpdateAndPrint(void)
+ {
++    static uint32_t history_be_ms, history_le_ms;
++    PressureHistory_BeginCycle();
+     PressureFeat_t be_b = {0}, be_c = {0}, be_e = {0};
+     PressureFeat_t le_c = {0};
+     PressureFeat_t be_sum = {0};
+@@ -603,6 +606,7 @@
+ 
+     if (spi3_frame_ok)
+     {
++        history_be_ms = HAL_GetTick();
+         g_spi3_ok++;
+         memcpy(sensor_data.BE_arrayB, SPI3_RxData + 1, 64);
+         memcpy(sensor_data.BE_arrayC, SPI3_RxData + 65, 64);
+@@ -651,6 +655,7 @@
+ 
+     if (spi2_frame_ok)
+     {
++        history_le_ms = HAL_GetTick();
+         g_spi2_ok++;
+         memcpy(sensor_data.LE_arrayC, SPI2_RxData + 1, 64);
+         g_raw_le_c_max = Pressure_RawMax32(sensor_data.LE_arrayC);
+@@ -702,6 +707,13 @@
+                              (g_unlock_pending? PRESS_SAFE_FLAG_ARMING   : 0u));
+ 
+     // ==================== 通过 UART1 打印 ====================
++    /* Archive raw counts after the existing pressure safety calculation. */
++    PressureHistory_PushCycle(
++        sensor_data.BE_arrayB, sensor_data.BE_arrayC, sensor_data.BE_arrayE, sensor_data.LE_arrayC,
++        history_be_ms, history_le_ms,
++        (uint16_t)(spi3_frame_ok | (spi2_frame_ok << 1) | (s_have_be << 2) | (s_have_le << 3)),
++        (uint16_t)((g_be_b.calibrated << 0) | (g_be_c.calibrated << 1) | (g_be_e.calibrated << 2) | (g_le_c.calibrated << 3)));
++
+     Pressure_PublishFeature(PRESSURE_REGION_TOTAL,  &total);
+     Pressure_PublishFeature(PRESSURE_REGION_BE_SUM, &be_sum);
+     Pressure_PublishFeature(PRESSURE_REGION_BE_B,   &be_b);
+--- a/5_夹爪总程序id2slave2/User/Pressure_Sensor/pressure_history.c
++++ b/5_夹爪总程序id2slave2/User/Pressure_Sensor/pressure_history.c
+@@ -0,0 +1,170 @@
++#include "pressure_history.h"
++#include "main.h"
++#include <string.h>
++
++typedef struct {
++    uint32_t seq, be_ms, le_ms;
++    uint16_t flags, cal_mask, raw[MAT_RAW_WORDS];
++    uint32_t crc;
++} MatRecord;
++typedef char mat_record_size_check[(sizeof(MatRecord) == 276u) ? 1 : -1];
++
++static MatRecord queue[MAT_QUEUE_CAPACITY];
++static uint64_t session;
++static uint32_t produced, acknowledged, final_seq, drops;
++static uint16_t command[MAT_COMMAND_WORDS];
++static uint16_t device, layout_id, head, used, result, done_token;
++static uint8_t recording, stopped, overflow, busy, have_command, writing, readers;
++
++static uint32_t lock(void) { uint32_t p = __get_PRIMASK(); __disable_irq(); return p; }
++static void unlock(uint32_t p) { if (!p) __enable_irq(); }
++static uint32_t words32(const uint16_t *p) { return ((uint32_t)p[0] << 16) | p[1]; }
++static uint64_t command_session(void) {
++    return ((uint64_t)words32(command + 1) << 32) | words32(command + 3);
++}
++static void put32(uint16_t *p, uint32_t v) { p[0] = (uint16_t)(v >> 16); p[1] = (uint16_t)v; }
++static void put64(uint16_t *p, uint64_t v) { put32(p, (uint32_t)(v >> 32)); put32(p + 2, (uint32_t)v); }
++static uint32_t crc_byte(uint32_t c, uint8_t b) {
++    unsigned i;
++    c ^= b;
++    for (i = 0; i < 8u; ++i) c = (c >> 1) ^ ((c & 1u) ? 0xEDB88320u : 0u);
++    return c;
++}
++static uint32_t crc_word(uint32_t c, uint16_t w) {
++    return crc_byte(crc_byte(c, (uint8_t)(w >> 8)), (uint8_t)w);
++}
++static uint32_t record_crc(const MatRecord *r) {
++    uint16_t prefix[16];
++    uint32_t c = 0xFFFFFFFFu;
++    unsigned i;
++    prefix[0] = MAT_PROTOCOL_VER; prefix[1] = device; prefix[2] = layout_id;
++    put64(prefix + 3, session); put32(prefix + 7, r->seq);
++    put32(prefix + 9, r->be_ms); put32(prefix + 11, r->le_ms);
++    prefix[13] = r->flags; prefix[14] = r->cal_mask; prefix[15] = MAT_RAW_WORDS;
++    for (i = 0; i < 16u; ++i) c = crc_word(c, prefix[i]);
++    for (i = 0; i < MAT_RAW_WORDS; ++i) c = crc_word(c, r->raw[i]);
++    return c ^ 0xFFFFFFFFu;
++}
++
++void PressureHistory_Init(uint16_t slave, uint16_t layout) {
++    memset(queue, 0, sizeof(queue)); memset(command, 0, sizeof(command));
++    session = 0; produced = acknowledged = final_seq = drops = 0;
++    head = used = result = done_token = 0;
++    recording = stopped = overflow = busy = have_command = writing = readers = 0;
++    device = slave; layout_id = layout;
++}
++
++uint8_t PressureHistory_SubmitCommand(const uint16_t *words) {
++    uint32_t p = lock();
++    uint8_t error = 0;
++    if (busy) {
++        error = memcmp(words, command, sizeof(command)) ? 0x06u : 0u;
++    } else if (have_command && words[7] == command[7]) {
++        error = memcmp(words, command, sizeof(command)) ? 0x03u : 0u;
++    } else if (words[0] < MAT_START || words[0] > MAT_ACK_DURABLE ||
++               !(words[1] | words[2] | words[3] | words[4]) ||
++               (words[0] != MAT_ACK_DURABLE && (words[5] | words[6])) ||
++               (words[0] == MAT_ACK_DURABLE && !(words[5] | words[6]))) {
++        error = 0x03u;
++    } else {
++        memcpy(command, words, sizeof(command));
++        have_command = busy = 1u; result = 1u;
++    }
++    unlock(p);
++    return error;
++}
++
++/* Only short state transitions run with IRQs masked. No SPI, copying of raw
++ * frames, CRC computation, UART waits or storage operations in this section. */
++static void service(uint8_t boundary) {
++    uint32_t p = lock();
++    uint64_t requested;
++    uint32_t seq;
++    uint16_t rc = 0;
++    if (!busy || writing || readers ||
++        (!boundary && command[0] != MAT_ACK_DURABLE)) { unlock(p); return; }
++    requested = command_session(); seq = words32(command + 5);
++    if (command[0] == MAT_START) {
++        if (requested != session) {
++            if (recording || used) rc = 3u;
++            else {
++                session = requested; produced = acknowledged = final_seq = drops = 0;
++                head = 0; recording = 1u; stopped = overflow = 0;
++            }
++        }
++    } else if (requested != session) rc = 2u;
++    else if (command[0] == MAT_STOP) {
++        recording = 0; stopped = 1u; final_seq = produced;
++    } else if (seq <= acknowledged) {
++        /* Durable ACK retransmission: never pop a second frame. */
++    } else if (!used || queue[head].seq != seq) rc = 4u;
++    else {
++        acknowledged = seq; head = (uint16_t)((head + 1u) % MAT_QUEUE_CAPACITY); --used;
++    }
++    result = rc; done_token = command[7]; busy = 0;
++    unlock(p);
++}
++void PressureHistory_BeginCycle(void) { service(1u); }
++void PressureHistory_Service(void) { service(0u); }
++
++void PressureHistory_PushCycle(const uint16_t *r0, const uint16_t *r1,
++                              const uint16_t *r2, const uint16_t *r3,
++                              uint32_t be_ms, uint32_t le_ms,
++                              uint16_t flags, uint16_t cal_mask) {
++    MatRecord *r;
++    uint32_t p = lock();
++    if (!recording) { unlock(p); return; }
++    ++produced;
++    if (used == MAT_QUEUE_CAPACITY) {
++        ++drops; overflow = stopped = 1u; recording = 0; final_seq = produced;
++        unlock(p); return;
++    }
++    writing = 1u;
++    r = &queue[(head + used) % MAT_QUEUE_CAPACITY];
++    r->seq = produced;
++    unlock(p);
++    r->be_ms = be_ms; r->le_ms = le_ms;
++    r->flags = (uint16_t)((flags & 0x000Fu) | 0x8000u); r->cal_mask = cal_mask & 15u;
++    memcpy(r->raw, r0, 64u); memcpy(r->raw + 32, r1, 64u);
++    memcpy(r->raw + 64, r2, 64u); memcpy(r->raw + 96, r3, 64u);
++    r->crc = record_crc(r);
++    p = lock();
++    ++used; writing = 0;
++    if (produced == 0xFFFFFFFFu) { recording = 0; stopped = 1u; final_seq = produced; }
++    unlock(p);
++}
++
++void PressureHistory_ReadRegs(uint16_t start, uint16_t count, uint8_t *out) {
++    uint16_t state[32], header[16];
++    const MatRecord *r;
++    uint16_t i, value, addr;
++    uint32_t p;
++    if (start < MAT_REG_FIRST || start >= MAT_REG_END || count > MAT_REG_END - start) return;
++    memset(state, 0, sizeof(state)); memset(header, 0, sizeof(header));
++    p = lock();
++    ++readers;
++    r = used ? &queue[head] : 0;
++    state[0] = MAT_PROTOCOL_VER;
++    state[1] = (uint16_t)(recording | (used ? 2u : 0u) | (overflow ? 4u : 0u) |
++                          (stopped ? 8u : 0u) | (busy ? 16u : 0u));
++    state[2] = used; state[3] = MAT_QUEUE_CAPACITY;
++    put32(state + 4, produced); put32(state + 6, acknowledged);
++    put32(state + 8, final_seq); put32(state + 10, drops);
++    state[12] = layout_id; state[13] = MAT_RAW_WORDS;
++    state[14] = result; state[15] = done_token;
++    memcpy(state + 16, command, sizeof(command));
++    header[0] = MAT_PROTOCOL_VER; header[1] = layout_id; put64(header + 2, session);
++    unlock(p);
++    if (r) {
++        put32(header + 6, r->seq); put32(header + 8, r->be_ms); put32(header + 10, r->le_ms);
++        header[12] = r->flags; header[13] = r->cal_mask; put32(header + 14, r->crc);
++    }
++    for (i = 0; i < count; ++i) {
++        addr = start + i;
++        if (addr < MAT_REG_HEAD) value = state[addr - MAT_REG_FIRST];
++        else if (addr < MAT_REG_RAW) value = header[addr - MAT_REG_HEAD];
++        else value = r ? r->raw[addr - MAT_REG_RAW] : 0u;
++        out[2u*i] = (uint8_t)(value >> 8); out[2u*i + 1u] = (uint8_t)value;
++    }
++    p = lock(); --readers; unlock(p);
++}
+--- a/5_夹爪总程序id2slave2/User/Pressure_Sensor/pressure_history.h
++++ b/5_夹爪总程序id2slave2/User/Pressure_Sensor/pressure_history.h
+@@ -0,0 +1,30 @@
++#ifndef PRESSURE_HISTORY_H
++#define PRESSURE_HISTORY_H
++#include <stdint.h>
++
++#define MAT_REG_FIRST       0x0150u
++#define MAT_REG_COMMAND     0x0160u
++#define MAT_COMMAND_WORDS   8u
++#define MAT_REG_HEAD        0x0170u
++#define MAT_REG_RAW         0x0180u
++#define MAT_REG_END         0x0200u
++#define MAT_RAW_WORDS       128u
++#define MAT_QUEUE_CAPACITY  4u
++#define MAT_PROTOCOL_VER   1u
++#define MAT_START           1u
++#define MAT_STOP            2u
++#define MAT_ACK_DURABLE     3u
++
++/* Init before scheduling. BeginCycle and PushCycle: sole pressure producer.
++ * SubmitCommand: UART ISR; Service: communication task. ReadRegs outputs
++ * big-endian bytes and pins one head for the entire response range. */
++void PressureHistory_Init(uint16_t slave, uint16_t layout);
++void PressureHistory_BeginCycle(void);
++void PressureHistory_PushCycle(const uint16_t *r0, const uint16_t *r1,
++                              const uint16_t *r2, const uint16_t *r3,
++                              uint32_t be_ms, uint32_t le_ms,
++                              uint16_t flags, uint16_t cal_mask);
++uint8_t PressureHistory_SubmitCommand(const uint16_t words[MAT_COMMAND_WORDS]);
++void PressureHistory_Service(void);
++void PressureHistory_ReadRegs(uint16_t start, uint16_t count, uint8_t *out);
++#endif
+--- a/5_夹爪总程序id2slave2/User/Modbus/dm_modbus_bridge.c
++++ b/5_夹爪总程序id2slave2/User/Modbus/dm_modbus_bridge.c
+@@ -1,3 +1,4 @@
++#include "pressure_history.h"
+ #include "dm_modbus_bridge.h"
+ #include "dm_motor_ctrl.h"
+ #include "dm_motor_drv.h"
+@@ -740,7 +741,9 @@
+ }
+ 
+ static void bridge_service_uart_tx(uint32_t now_ms){
+-    if(s_tx_busy && ((now_ms - s_tx_started_ms) > 20u)){
++    uint32_t baud = s_huart->Init.BaudRate ? s_huart->Init.BaudRate : 115200u;
++    uint32_t tx_timeout_ms = ((uint32_t)s_txlen * 10000u + baud - 1u) / baud + 10u;
++    if(s_tx_busy && ((now_ms - s_tx_started_ms) > tx_timeout_ms)){
+         (void)HAL_UART_AbortTransmit_IT(s_huart);
+         s_tx_busy = 0u;
+         s_tx_pending = 0u;
+@@ -839,6 +842,8 @@
+ 
+ /* ------------------------ 只读寄存器保护 ------------------------ */
+ static uint8_t is_readonly_reg(uint16_t reg){
++    /* All history writes are handled by the dedicated atomic FC10 path. */
++    if(reg >= MAT_REG_FIRST && reg < MAT_REG_END) return 1;
+     /* 固定设备信息只读 */
+     if(reg == REG_DEV_ID || reg == REG_FW_VER) return 1;
+ 
+@@ -1457,6 +1462,7 @@
+     uint32_t now = HAL_GetTick();
+     estimator_sample_t estimator_sample;
+ 
++    PressureHistory_Service();
+     bridge_service_uart_tx(now);
+     bridge_ota_poll(now);
+     if(s_ota_reset_requested){
+@@ -1525,6 +1531,7 @@
+  */
+ void DM_Bridge_OnUartIdle(UART_HandleTypeDef *huart, uint16_t size){
+     if(huart != s_huart) return;
++    if(s_tx_busy || s_tx_pending) return;
+     s_rxlen = size;
+     (void)s_rxlen;
+ 
+@@ -1561,9 +1568,12 @@
+                 {
+                     uint16_t start = (uint16_t)((f[2] << 8) | f[3]);
+                     uint16_t count = (uint16_t)((f[4] << 8) | f[5]);
+-                    if(count == 0u ||
+-                       start >= (sizeof(s_regs)/sizeof(s_regs[0])) ||
+-                       count > ((sizeof(s_regs)/sizeof(s_regs[0])) - start)) count = 0;
++                    if(count == 0u || count > 125u || (5u + 2u * count) > TX_BUF_SZ){
++                        respond_exception(func, 0x03); return;
++                    }
++                    if(start >= 0x200u || count > (0x200u - start)){
++                        respond_exception(func, 0x02); return;
++                    }
+ 
+                     s_txbuf[0] = BRIDGE_SLAVE_ADDR;
+                     s_txbuf[1] = 0x03;
+@@ -1575,6 +1585,13 @@
+                             s_txbuf[3 + 2*i]     = (uint8_t)(v >> 8);
+                             s_txbuf[3 + 2*i + 1] = (uint8_t)(v & 0xFF);
+                         }
++                    }
++                    /* One pinned history snapshot for the whole response, including
++                     * requests crossing from legacy registers into the new range. */
++                    if(start + count > MAT_REG_FIRST){
++                        uint16_t first = start < MAT_REG_FIRST ? MAT_REG_FIRST : start;
++                        PressureHistory_ReadRegs(first, (uint16_t)(start + count - first),
++                                                 s_txbuf + 3u + 2u * (first - start));
+                     }
+                     txlen = (uint16_t)(3 + count*2);
+                 }
+@@ -1728,6 +1745,21 @@
+                         return;
+                     }
+ 
++                    if(start + count > MAT_REG_FIRST){
++                        uint16_t words[MAT_COMMAND_WORDS];
++                        uint8_t error;
++                        if(start != MAT_REG_COMMAND || count != MAT_COMMAND_WORDS ||
++                           bytecnt != 16u || framelen != 25u){
++                            respond_exception(func, 0x02); return;
++                        }
++                        for(i = 0; i < MAT_COMMAND_WORDS; ++i)
++                            words[i] = (uint16_t)(((uint16_t)f[7 + 2*i] << 8) | f[8 + 2*i]);
++                        error = PressureHistory_SubmitCommand(words);
++                        if(error){ respond_exception(func, error); return; }
++                        memcpy(s_txbuf, f, 6u); txlen = 6u;
++                        goto done;
++                    }
++
+                     /* OTA authorization must use three ordered 0x06 writes. */
+                     if(start <= REG_OTA_CTRL && (start + count) > REG_OTA_KEY1){
+                         respond_exception(func, 0x03);
+--- a/5_夹爪总程序id2slave2/Core/Src/app_freertos.c
++++ b/5_夹爪总程序id2slave2/Core/Src/app_freertos.c
+@@ -25,6 +25,7 @@
+ 
+ /* Private includes ----------------------------------------------------------*/
+ /* USER CODE BEGIN Includes */
++#include "pressure_history.h"
+ #include "AS5048A.h"
+ #include "bsp_fdcan.h"
+ #include "dm_motor_ctrl.h"
+@@ -129,6 +130,7 @@
+   */
+ void MX_FREERTOS_Init(void) {
+   /* USER CODE BEGIN Init */
++  PressureHistory_Init(2u, 2u);
+ 
+   /* USER CODE END Init */
+ 
+--- a/5_夹爪总程序id2slave2/MDK-ARM/JIAZHUA_RTOS.uvprojx
++++ b/5_夹爪总程序id2slave2/MDK-ARM/JIAZHUA_RTOS.uvprojx
+@@ -883,6 +883,11 @@
+               <FileType>1</FileType>
+               <FilePath>..\User\Pressure_Sensor\Pressure_Sensor.c</FilePath>
+             </File>
++            <File>
++              <FileName>pressure_history.c</FileName>
++              <FileType>1</FileType>
++              <FilePath>..\User\Pressure_Sensor\pressure_history.c</FilePath>
++            </File>
+           </Files>
+         </Group>
+         <Group>
+--- a/5_夹爪总程序id2slave2/PC_Tool/3_gripper.py
++++ b/5_夹爪总程序id2slave2/PC_Tool/3_gripper.py
+@@ -397,6 +397,9 @@
+             row=1, column=0, columnspan=11, padx=4, pady=(4, 0), sticky="ew"
+         )
+ 
++        from tactile_ui import TactilePanel
++        self.tactile = TactilePanel(self, conn)
++
+         quick = ttk.LabelFrame(frm, text="常用指令", padding=8)
+         quick.grid(row=1, column=0, sticky="ew", pady=8)
+         for i in range(12):
+@@ -598,6 +601,10 @@
+             messagebox.showerror("连接失败", str(exc))
+ 
+     def disconnect(self):
++        if self.tactile.active.is_set():
++            self.tactile.stop.set()
++            self.log("Please wait for matrix STOP/drain before disconnecting.")
++            return
+         self._stop_safe_poll()
+         if self.ser:
+             try:
+@@ -621,6 +628,10 @@
+             pass
+ 
+     def _send_and_recv(self, req: bytes, quiet: bool = False) -> bytes | None:
++        if (self.tactile.active.is_set() and len(req) >= 6 and req[1] in (6, 16)
++                and int.from_bytes(req[2:4], "big") + (int.from_bytes(req[4:6], "big") if req[1] == 16 else 1) > 0x150):
++            self.log("Matrix registers are owned by the recorder during capture.")
++            return None
+         if not self.ser:
+             if not quiet:
+                 messagebox.showwarning("提示", "请先连接串口")
+@@ -632,6 +643,7 @@
+         self.manual_io_pending.set()
+         try:
+             with self.rx_lock:
++                time.sleep(0.00175)
+                 serial_timeout = self.ser.timeout
+                 self.ser.reset_input_buffer()
+                 self.ser.write(req)
+--- a/5_夹爪总程序id2slave2/PC_Tool/tactile_protocol.py
++++ b/5_夹爪总程序id2slave2/PC_Tool/tactile_protocol.py
+@@ -0,0 +1,230 @@
++"""Matrix protocol v1. All Modbus addresses are zero based."""
++from dataclasses import dataclass
++import struct
++import time
++import zlib
++
++STATUS, COMMAND, HEAD, SECOND = 0x150, 0x160, 0x170, 0x1C0
++START, STOP, ACK = 1, 2, 3
++LAYOUTS = {1: ('BE_C', 'BE_D', 'BE_E', 'LE_C'), 2: ('BE_B', 'BE_C', 'BE_E', 'LE_C')}
++PREFIX = struct.Struct('>HHHQIIIHHH')
++
++class ProtocolError(RuntimeError):
++    pass
++
++class ModbusError(ProtocolError):
++    def __init__(self, code):
++        self.code = code
++        super().__init__(f'Modbus exception 0x{code:02X}')
++
++def crc16(data):
++    c = 0xFFFF
++    for b in data:
++        c ^= b
++        for _ in range(8):
++            c = (c >> 1) ^ (0xA001 if c & 1 else 0)
++    return c
++
++def packet(data):
++    return data + struct.pack('<H', crc16(data))
++
++def u32(words):
++    return (words[0] << 16) | words[1]
++
++def u64(words):
++    return (u32(words[:2]) << 32) | u32(words[2:4])
++
++@dataclass(frozen=True)
++class Frame:
++    slave: int
++    layout: int
++    session: int
++    sequence: int
++    be_ms: int
++    le_ms: int
++    flags: int
++    cal_mask: int
++    raw: tuple
++    crc: int
++    version: int = 1
++
++    def payload(self):
++        return PREFIX.pack(self.version, self.slave, self.layout, self.session,
++                           self.sequence, self.be_ms, self.le_ms, self.flags,
++                           self.cal_mask, 128) + struct.pack('>128H', *self.raw)
++
++    def validate(self):
++        if (self.version != 1 or self.slave not in (1, 2) or self.layout != self.slave or
++                not self.session or not self.sequence or len(self.raw) != 128 or
++                not self.flags & 0x8000 or self.flags & ~0x800F or self.cal_mask & ~15):
++            raise ProtocolError('Invalid frame identity, version, flags or layout')
++        if zlib.crc32(self.payload()) != self.crc:
++            raise ProtocolError('Whole-record CRC32 mismatch')
++        return self
++
++    @classmethod
++    def from_payload(cls, payload, crc):
++        if len(payload) != 288:
++            raise ProtocolError('Expected 288 canonical bytes')
++        ver, slave, layout, session, seq, be, le, flags, cal, count = PREFIX.unpack(payload[:32])
++        if count != 128:
++            raise ProtocolError('Invalid matrix size')
++        return cls(slave, layout, session, seq, be, le, flags, cal,
++                   struct.unpack('>128H', payload[32:]), crc, ver).validate()
++
++    @classmethod
++    def from_registers(cls, slave, first, second):
++        if len(first) != 80 or len(second) != 64:
++            raise ProtocolError('Incomplete matrix halves')
++        return cls(slave, first[1], u64(first[2:6]), u32(first[6:8]),
++                   u32(first[8:10]), u32(first[10:12]), first[12], first[13],
++                   tuple(first[16:] + second), u32(first[14:16]), first[0]).validate()
++
++@dataclass(frozen=True)
++class Status:
++    flags: int
++    count: int
++    capacity: int
++    produced: int
++    acknowledged: int
++    final: int
++    drops: int
++    layout: int
++    result: int
++    done_token: int
++
++    @classmethod
++    def parse(cls, r):
++        if len(r) != 16 or r[0] != 1 or r[13] != 128:
++            raise ProtocolError('Matrix protocol is unavailable or incompatible')
++        return cls(r[1], r[2], r[3], u32(r[4:6]), u32(r[6:8]),
++                   u32(r[8:10]), u32(r[10:12]), r[12], r[14], r[15])
++
++class SerialTransport:
++    """Caller serializes every transaction with controls on the SAME bus lock."""
++    def __init__(self, serial_port, timeout=0.15):
++        self.serial = serial_port
++        self.timeout = timeout
++        self.last_end = 0.0
++
++    def __call__(self, request):
++        s = self.serial
++        time.sleep(max(0, 0.00175 - (time.monotonic() - self.last_end)))
++        old = s.timeout
++        try:
++            s.timeout = min(0.01, self.timeout)
++            s.reset_input_buffer()
++            s.write(request)
++            s.flush()
++            deadline = time.monotonic() + self.timeout
++            buf = bytearray()
++            while time.monotonic() < deadline:
++                buf.extend(s.read(1))
++                if len(buf) >= 3:
++                    length = 5 if buf[1] & 0x80 else (5 + buf[2] if buf[1] == 3 else 8)
++                    if len(buf) == length:
++                        return bytes(buf)
++            raise TimeoutError('RS485 response timeout')
++        finally:
++            s.timeout = old
++            self.last_end = time.monotonic()
++
++class MatrixClient:
++    """One command in flight per gripper; transaction callback may yield to controls."""
++    def __init__(self, exchange, slave):
++        if slave not in (1, 2):
++            raise ValueError('slave must be 1 or 2')
++        self.exchange, self.slave = exchange, slave
++        self.token = None
++        self.prefetched = None
++
++    def _request(self, body):
++        response = self.exchange(packet(bytes([self.slave]) + body))
++        if not response or len(response) < 5 or crc16(response[:-2]) != int.from_bytes(response[-2:], 'little'):
++            raise ProtocolError('Missing or corrupt Modbus response')
++        if response[0] != self.slave:
++            raise ProtocolError('Wrong slave')
++        if response[1] == body[0] | 0x80:
++            raise ModbusError(response[2])
++        if response[1] != body[0]:
++            raise ProtocolError('Wrong function')
++        return response
++
++    def read(self, address, count):
++        for attempt in range(3):
++            try:
++                r = self._request(struct.pack('>BHH', 3, address, count))
++                if len(r) != 5 + 2 * count or r[2] != 2 * count:
++                    raise ProtocolError('Wrong register count')
++                return list(struct.unpack(f'>{count}H', r[3:-2]))
++            except ModbusError:
++                raise
++            except (TimeoutError, ProtocolError):
++                if attempt == 2:
++                    raise
++                time.sleep(0.001)
++
++    def status(self):
++        s = Status.parse(self.read(STATUS, 16))
++        if s.layout != self.slave:
++            raise ProtocolError('Wrong device layout')
++        return s
++
++    def session(self):
++        return u64(self.read(HEAD + 2, 4))
++
++    def frame(self):
++        first, self.prefetched = self.prefetched, None
++        if first is None:
++            first = self.read(HEAD, 80)
++        if not first[12] & 0x8000:
++            return None
++        return Frame.from_registers(self.slave, first, self.read(SECOND, 64))
++
++    def command(self, opcode, session, sequence=0, timeout=2.0):
++        if self.token is None:
++            self.token = (self.read(COMMAND, 8)[7] + 1) & 0xFFFF
++        token = self.token
++        words = [opcode, *struct.unpack('>4H', struct.pack('>Q', session)),
++                 sequence >> 16, sequence & 0xFFFF, token]
++        body = struct.pack('>BHHB8H', 16, COMMAND, 8, 16, *words)
++        deadline, accepted, last_error = time.monotonic() + timeout, False, None
++        while time.monotonic() < deadline:
++            try:
++                if not accepted:
++                    r = self._request(body)
++                    if r[2:6] != struct.pack('>HH', COMMAND, 8) or len(r) != 8:
++                        raise ProtocolError('Wrong command echo')
++                    accepted = True
++                # Fast ACK completion: only a durable ACK can advance this head.
++                if opcode == ACK:
++                    first = self.read(HEAD, 80)
++                    if u64(first[2:6]) != session:
++                        raise RuntimeError('Gripper reset or session changed during ACK')
++                    if first[12] & 0x8000 and u32(first[6:8]) > sequence:
++                        self.prefetched = first
++                        self.token = (token + 1) & 0xFFFF
++                        return None
++                s = self.status()
++                if not s.flags & 16 and s.done_token == token:
++                    if s.result:
++                        raise RuntimeError(f'Matrix command rejected: result={s.result}')
++                    if opcode != ACK and self.session() != session:
++                        raise RuntimeError('Command result belongs to a different session')
++                    valid = ((opcode == START and bool(s.flags & 1)) or
++                             (opcode == STOP and bool(s.flags & 8) and not s.flags & 1) or
++                             (opcode == ACK and s.acknowledged >= sequence))
++                    if not valid:
++                        raise RuntimeError('Command result has unexpected state')
++                    self.token = (token + 1) & 0xFFFF
++                    return s
++            except ModbusError as exc:
++                if exc.code != 6:
++                    raise
++                last_error, accepted = exc, False
++            except (TimeoutError, ProtocolError) as exc:
++                last_error, accepted = exc, False
++            time.sleep(0.001)
++        # The caller must stop/reconnect after an ambiguous completion. Never send
++        # different parameters using this token, and never silently create a session.
++        raise TimeoutError(f'Command completion unknown; reconnect to recover: {last_error}')
+--- a/5_夹爪总程序id2slave2/PC_Tool/tactile_recorder.py
++++ b/5_夹爪总程序id2slave2/PC_Tool/tactile_recorder.py
+@@ -0,0 +1,300 @@
++"""Durable SQLite WAL journal, background HDF5 export, USB recording CLI.
++
++The .wal.sqlite sidecar is the recovery source and is deliberately retained.
++ACK is permitted only after SQLite synchronous=FULL commit returns.
++"""
++import argparse
++from contextlib import closing
++import json
++import os
++from pathlib import Path
++import sqlite3
++import struct
++import threading
++import time
++
++from tactile_protocol import MatrixClient, Frame, LAYOUTS, START, STOP, ACK
++
++class Recorder:
++    def __init__(self, output):
++        # Import before starting a device session; fail early if dependencies missing.
++        import h5py
++        import numpy
++        self.path = Path(output).resolve()
++        self.db_path = Path(str(self.path) + '.wal.sqlite')
++        self.partial = Path(str(self.path) + '.partial.h5')
++        if self.path.exists() and not self.db_path.exists():
++            raise FileExistsError('Existing HDF5 has no matching journal; choose a new path')
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self.lockfile = open(str(self.db_path) + '.lock', 'a+b')
++        self.lockfile.seek(0)
++        if os.name == 'nt':
++            import msvcrt
++            try:
++                msvcrt.locking(self.lockfile.fileno(), msvcrt.LK_NBLCK, 1)
++            except OSError:
++                self.lockfile.close()
++                raise RuntimeError('Recording file is in use by another process')
++        else:
++            import fcntl
++            fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        self.db = sqlite3.connect(self.db_path)
++        self.db.execute('PRAGMA journal_mode=WAL')
++        self.db.execute('PRAGMA synchronous=FULL')
++        self.db.executescript('''
++          CREATE TABLE IF NOT EXISTS sessions (
++            slave INTEGER NOT NULL, session TEXT NOT NULL, final INTEGER,
++            drops INTEGER, acknowledged INTEGER, complete INTEGER NOT NULL DEFAULT 0,
++            PRIMARY KEY(slave,session));
++          CREATE TABLE IF NOT EXISTS frames (
++            id INTEGER PRIMARY KEY, slave INTEGER NOT NULL, session TEXT NOT NULL,
++            sequence INTEGER NOT NULL, payload BLOB NOT NULL, crc INTEGER NOT NULL,
++            received_ns INTEGER NOT NULL, UNIQUE(slave,session,sequence));
++        ''')
++        self.db.commit()
++        self.error = None
++        self.finished = threading.Event()
++        self.thread = threading.Thread(target=self._export, name='tactile-hdf5', daemon=True)
++        self.thread.start()
++        self.closed = False
++
++    def check(self):
++        if self.error:
++            raise RuntimeError(f'HDF5 writer failed; journal retained: {self.error}') from self.error
++
++    def start_session(self, slave):
++        self.check()
++        # time_ns is a nonzero 64-bit identifier. Monotonic within this persistent journal.
++        allocator = Path(os.environ.get('TACTILE_SESSION_DB', str(Path.home() / '.gripper_tactile_sessions.sqlite')))
++        allocator.parent.mkdir(parents=True, exist_ok=True)
++        with closing(sqlite3.connect(allocator, timeout=5)) as ids:
++            ids.execute('PRAGMA synchronous=FULL')
++            ids.execute('CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)')
++            ids.execute('BEGIN IMMEDIATE')
++            row = ids.execute('SELECT value FROM counter WHERE id=1').fetchone()
++            last = int(row[0],16) if row else 0
++            session = max(time.time_ns(), last+1)
++            ids.execute('INSERT OR REPLACE INTO counter VALUES (1,?)',(f'{session:016x}',))
++            ids.commit()
++        if session >= 2**64:
++            raise OverflowError('Session identifier exhausted')
++        with self.db:
++            self.db.execute('INSERT INTO sessions(slave,session) VALUES (?,?)', (slave, f'{session:016x}'))
++        return session
++
++    def has_session(self, slave, session):
++        return self.db.execute('SELECT 1 FROM sessions WHERE slave=? AND session=?',
++                               (slave, f'{session:016x}')).fetchone() is not None
++
++    def last_sequence(self, slave, session):
++        return self.db.execute('SELECT COALESCE(MAX(sequence),0) FROM frames WHERE slave=? AND session=?',
++                               (slave, f'{session:016x}')).fetchone()[0]
++
++    def append(self, frame):
++        self.check()
++        frame.validate()
++        key = (frame.slave, f'{frame.session:016x}', frame.sequence)
++        if not self.has_session(frame.slave, frame.session):
++            raise RuntimeError('Unknown session; refusing to claim a complete recording')
++        old = self.db.execute('SELECT payload,crc FROM frames WHERE slave=? AND session=? AND sequence=?', key).fetchone()
++        if old:
++            if old != (frame.payload(), frame.crc):
++                raise RuntimeError('Same frame identity has different contents')
++            return False
++        expected = self.last_sequence(frame.slave, frame.session) + 1
++        if frame.sequence != expected:
++            raise RuntimeError(f'Missing matrix: expected {expected}, received {frame.sequence}')
++        with self.db:
++            self.db.execute('INSERT INTO frames(slave,session,sequence,payload,crc,received_ns) VALUES (?,?,?,?,?,?)',
++                            (*key, frame.payload(), frame.crc, time.time_ns()))
++        # Only after successful FULL synchronous commit may caller send ACK.
++        return True
++
++    def finish_session(self, slave, session, status):
++        last = self.last_sequence(slave, session)
++        complete = (not status.flags & (1 | 4 | 16) and bool(status.flags & 8) and
++                    status.count == 0 and status.drops == 0 and
++                    last == status.acknowledged == status.final == status.produced)
++        with self.db:
++            self.db.execute('UPDATE sessions SET final=?,drops=?,acknowledged=?,complete=? WHERE slave=? AND session=?',
++                            (status.final, status.drops, status.acknowledged, int(complete), slave, f'{session:016x}'))
++        return complete
++
++    def _export(self):
++        import h5py
++        import numpy as np
++        db = None
++        try:
++            db = sqlite3.connect(self.db_path)
++            last_id = 0
++            with h5py.File(self.partial, 'w') as h:
++                meta = h.create_group('metadata')
++                meta.attrs['protocol_version'] = 1
++                meta.attrs['units'] = 'raw_sensor_counts'
++                meta.attrs['time_basis'] = 'be_ms/le_ms: MCU uint32 milliseconds; receive_time: Unix nanoseconds'
++                meta.attrs['recovery_journal'] = self.db_path.name
++                groups = {}
++                while True:
++                    rows = db.execute('SELECT id,payload,crc,received_ns FROM frames WHERE id>? ORDER BY id LIMIT 128', (last_id,)).fetchall()
++                    for rowid, payload, crc, received in rows:
++                        f = Frame.from_payload(payload, crc)
++                        name = f'gripper{f.slave}/{f.session:016x}'
++                        if name not in groups:
++                            g = h.require_group(name)
++                            g.attrs['regions'] = json.dumps(LAYOUTS[f.layout])
++                            g.attrs['layout_id'] = f.layout
++                            g.attrs['session_id'] = np.uint64(f.session)
++                            g.attrs['complete'] = False
++                            g.create_dataset('raw', (0,4,8,4), maxshape=(None,4,8,4), dtype='uint16', chunks=(64,4,8,4), compression='lzf', fletcher32=True)
++                            for field,dtype in [('sequence','uint32'),('be_ms','uint32'),('le_ms','uint32'),('receive_time','int64'),('sample_flags','uint16'),('cal_mask','uint16'),('crc32','uint32')]:
++                                g.create_dataset(field, (0,), maxshape=(None,), dtype=dtype, chunks=(256,), fletcher32=True)
++                            groups[name] = g
++                        g = groups[name]
++                        index = len(g['sequence'])
++                        values = dict(raw=np.asarray(f.raw,dtype='uint16').reshape(4,8,4), sequence=f.sequence,
++                                      be_ms=f.be_ms, le_ms=f.le_ms, receive_time=received,
++                                      sample_flags=f.flags, cal_mask=f.cal_mask, crc32=f.crc)
++                        for field,value in values.items():
++                            ds = g[field]
++                            ds.resize(index+1, axis=0)
++                            ds[index] = value
++                        last_id = rowid
++                    for slave,session,final,drops,ack,complete in db.execute('SELECT * FROM sessions'):
++                        g = h.require_group(f'gripper{slave}/{session}')
++                        g.attrs['complete'] = bool(complete)
++                        if final is not None:
++                            g.attrs['final_sequence'] = final
++                            g.attrs['drop_count'] = drops
++                            g.attrs['acknowledged'] = ack
++                    h.flush()
++                    if self.finished.is_set() and not rows:
++                        break
++                    self.finished.wait(0.05)
++            # Closed HDF5 is flushed through the OS. Journal remains for recovery.
++            with open(self.partial, 'r+b') as f:
++                os.fsync(f.fileno())
++            verify_h5(self.partial)
++            os.replace(self.partial, self.path)
++        except BaseException as exc:
++            self.error = exc
++        finally:
++            if db is not None:
++                db.close()
++
++    def close(self):
++        if self.closed:
++            return
++        self.closed = True
++        self.finished.set()
++        self.thread.join()
++        self.db.close()
++        self.lockfile.close()
++        self.check()
++
++
++def verify_h5(path):
++    import h5py
++    report = {}
++    with h5py.File(path, 'r') as h:
++        for slave in (1,2):
++            root = h.get(f'gripper{slave}')
++            if root is None:
++                continue
++            for session,g in root.items():
++                n = len(g['sequence']) if 'sequence' in g else 0
++                if n:
++                    if g['raw'].shape != (n,4,8,4) or any(len(g[k]) != n for k in ('be_ms','le_ms','receive_time','sample_flags','cal_mask','crc32')):
++                        raise RuntimeError('HDF5 dataset length mismatch')
++                    for i in range(n):
++                        f = Frame(slave,int(g.attrs['layout_id']),int(session,16),int(g['sequence'][i]),
++                                  int(g['be_ms'][i]),int(g['le_ms'][i]),int(g['sample_flags'][i]),int(g['cal_mask'][i]),
++                                  tuple(int(x) for x in g['raw'][i].flat),int(g['crc32'][i]))
++                        f.validate()
++                        if f.sequence != i+1:
++                            raise RuntimeError('HDF5 sequence gap/duplicate')
++                if g.attrs.get('complete',False) and (n != g.attrs.get('final_sequence',-1) or g.attrs.get('drop_count',-1) != 0 or n != g.attrs.get('acknowledged',-1)):
++                    raise RuntimeError('HDF5 completion assertion is inconsistent')
++                report[f'gripper{slave}/{session}'] = {'frames': n, 'complete': bool(g.attrs.get('complete',False))}
++    return report
++
++
++def capture(client, recorder, stop_event, resume=False, seconds=None, notify=print):
++    status = client.status()
++    session = client.session()
++    if resume:
++        if not session or not recorder.has_session(client.slave, session):
++            raise RuntimeError('Resume needs the original journal and a surviving gripper session')
++        if recorder.last_sequence(client.slave, session) < status.acknowledged:
++            raise RuntimeError('Journal is missing data already released by the gripper')
++    else:
++        if status.count or status.flags & 1:
++            raise RuntimeError('Existing gripper session must be recovered first (--resume)')
++        session = recorder.start_session(client.slave)
++        client.command(START, session)
++    notify(f'Session {session:016x}; slave {client.slave}')
++    began, stopping, next_status, frames = time.monotonic(), False, 0.0, 0
++    while True:
++        recorder.check()
++        if not stopping and (stop_event.is_set() or (seconds is not None and time.monotonic()-began >= seconds)):
++            client.command(STOP, session)
++            stopping = True
++        frame = client.frame()
++        if frame is not None:
++            if frame.session != session:
++                raise RuntimeError('Gripper session changed; recording is incomplete')
++            recorder.append(frame)
++            client.command(ACK, session, frame.sequence)
++            frames += 1
++            if frames % 100 == 0:
++                notify(f'Archived sequence {frame.sequence}')
++        else:
++            time.sleep(0.002)
++        now = time.monotonic()
++        if now >= next_status or (stopping and frame is None):
++            status = client.status()
++            if client.session() != session:
++                raise RuntimeError('Gripper reset; recording is incomplete')
++            next_status = now + 1.0
++            if status.flags & 8:
++                stopping = True
++            if stopping and not status.count:
++                complete = recorder.finish_session(client.slave, session, status)
++                notify(f'Finished: complete={complete}, final={status.final}, drops={status.drops}')
++                if not complete:
++                    raise RuntimeError('Recording incomplete: overflow, sequence gap or missing ACK')
++                return
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--output', required=True, help='HDF5 output and journal basename')
++    p.add_argument('--port')
++    p.add_argument('--slave',type=int,choices=(1,2),default=1)
++    p.add_argument('--baud',type=int,default=115200)
++    p.add_argument('--seconds',type=float,default=10.0)
++    p.add_argument('--resume',action='store_true')
++    p.add_argument('--recover',action='store_true',help='Rebuild HDF5 from retained journal without hardware')
++    p.add_argument('--verify',action='store_true')
++    a = p.parse_args()
++    if a.verify:
++        print(json.dumps(verify_h5(a.output),indent=2)); return
++    if a.recover and not Path(a.output+'.wal.sqlite').exists():
++        p.error('Recovery journal does not exist')
++    if not a.recover and not a.port:
++        p.error('--port is required for USB capture')
++    recorder = Recorder(a.output)
++    try:
++        if not a.recover:
++            import serial
++            import signal
++            from tactile_protocol import SerialTransport
++            stop = threading.Event()
++            signal.signal(signal.SIGINT,lambda *_: stop.set())
++            with serial.Serial(a.port,a.baud,timeout=0.15,write_timeout=0.5) as s:
++                capture(MatrixClient(SerialTransport(s),a.slave),recorder,stop,a.resume,a.seconds)
++    finally:
++        recorder.close()
++    print(json.dumps(verify_h5(a.output),indent=2))
++
++if __name__ == '__main__':
++    main()
+--- a/5_夹爪总程序id2slave2/PC_Tool/tactile_ui.py
++++ b/5_夹爪总程序id2slave2/PC_Tool/tactile_ui.py
+@@ -0,0 +1,99 @@
++"""Tk integration: one existing serial port and transaction lock, manual controls first."""
++import queue
++import threading
++import time
++from tkinter import filedialog, ttk, messagebox
++
++class TactilePanel:
++    def __init__(self, app, parent):
++        self.app = app
++        self.active = threading.Event()
++        self.stop = threading.Event()
++        self.messages = queue.Queue()
++        self.closing = False
++        ttk.Button(parent,text='开始矩阵录制',command=self.start).grid(row=2,column=0,columnspan=2,pady=4)
++        ttk.Button(parent,text='恢复录制',command=lambda:self.start(True)).grid(row=2,column=2,pady=4)
++        ttk.Button(parent,text='停止并保存 H5',command=self.stop.set).grid(row=2,column=3,columnspan=2,pady=4)
++        self.label = ttk.Label(parent,text='矩阵: 未录制')
++        self.label.grid(row=2,column=5,columnspan=6,sticky='w')
++        app.root.after(100,self._poll)
++        app.root.protocol('WM_DELETE_WINDOW',self.close_window)
++
++    def start(self,resume=False):
++        if self.active.is_set():
++            return
++        if not self.app.ser:
++            messagebox.showwarning('矩阵录制','请先连接夹爪串口'); return
++        if resume:
++            journal = filedialog.askopenfilename(title='选择原录制日志',filetypes=[('恢复日志','*.wal.sqlite')])
++            if not journal: return
++            path = journal[:-len('.wal.sqlite')]
++        else:
++            path = filedialog.asksaveasfilename(title='保存矩阵数据',defaultextension='.h5',filetypes=[('HDF5','*.h5')])
++            if not path: return
++        try:
++            slave = self.app._slave()
++            if slave not in (1,2): raise ValueError('Slave 必须为 1 或 2')
++            import h5py, numpy
++        except Exception as exc:
++            messagebox.showerror('矩阵录制',str(exc)); return
++        self.stop.clear(); self.active.set()
++        self.label.configure(text='矩阵: 准备录制')
++        serial_port = self.app.ser
++        threading.Thread(target=self._worker,args=(serial_port,slave,path,resume),daemon=True).start()
++
++    def _worker(self,serial_port,slave,path,resume):
++        from tactile_protocol import MatrixClient, SerialTransport
++        from tactile_recorder import Recorder,capture
++        transport = SerialTransport(serial_port)
++        def exchange(request):
++            deadline = time.monotonic()+2
++            while True:
++                if not self.app.manual_io_pending.is_set() and self.app.rx_lock.acquire(timeout=0.005):
++                    if self.app.manual_io_pending.is_set():
++                        self.app.rx_lock.release()
++                    else:
++                        try:
++                            time.sleep(0.00175)
++                            return transport(request)
++                        finally:
++                            self.app.rx_lock.release()
++                if time.monotonic()>deadline:
++                    raise TimeoutError('控制指令持续占用总线，矩阵录制无法获得服务')
++                time.sleep(0.001)
++        recorder = None
++        try:
++            recorder = Recorder(path)
++            capture(MatrixClient(exchange,slave),recorder,self.stop,resume,notify=self.messages.put)
++            self.messages.put('采集结束，正在核验 HDF5')
++        except Exception as exc:
++            self.messages.put(f'录制未完整完成: {exc}；保留日志后可恢复')
++        finally:
++            if recorder is not None:
++                try:
++                    recorder.close()
++                    self.messages.put(f'HDF5 已生成: {path}（完整性见 complete 属性）')
++                except Exception as exc:
++                    self.messages.put(f'保存失败: {exc}')
++            self.messages.put(None)
++
++    def _poll(self):
++        try:
++            while True:
++                text = self.messages.get_nowait()
++                if text is None:
++                    self.active.clear()
++                else:
++                    self.label.configure(text=text)
++                    self.app.log(text)
++        except queue.Empty:
++            pass
++        if self.closing and not self.active.is_set():
++            self.app.disconnect(); self.app.root.destroy(); return
++        self.app.root.after(100,self._poll)
++
++    def close_window(self):
++        self.closing = True
++        self.stop.set()
++        if self.active.is_set():
++            self.label.configure(text='矩阵: 停止并保存后关闭窗口')
+--- a/5_夹爪总程序id2slave2/PC_Tool/requirements-tactile.txt
++++ b/5_夹爪总程序id2slave2/PC_Tool/requirements-tactile.txt
+@@ -0,0 +1,3 @@
++pyserial>=3.5
++numpy>=1.24
++h5py>=3.8

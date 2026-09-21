@@ -1,0 +1,102 @@
+/* === RS485 配置（在 main.c 顶部合适位置） === */
+#include "usart.h"
+#include "gpio.h"
+#include "RS485.h"
+#include <string.h>
+#include "cmsis_os.h"
+
+extern UART_HandleTypeDef huart2;   // usart2 句柄，CubeMX 生成在 usart.c/usart.h
+
+/* RS485 DE/RE 引脚：PA1。低=接收， 高=发送 */
+#define RS485_DE_GPIO_Port   GPIOA
+#define RS485_DE_Pin         GPIO_PIN_1
+
+volatile uint8_t rs485_tx_done = 1;
+
+/* 若要异步收数据，可开一个接收字节缓冲（可选） */
+static uint8_t rs485_rx_byte;
+
+/* 初始化 PA1 为输出并默认接收态 */
+ void RS485_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitStruct.Pin   = RS485_DE_Pin;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(RS485_DE_GPIO_Port, &GPIO_InitStruct);
+
+    /* 默认接收态：RE/DE=0 */
+    HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET);
+}
+
+/* 通过中断方式发送一段数据到 RS485（USART2） */
+ void RS485_Send_IT(const uint8_t *buf, uint16_t len)
+{
+    rs485_tx_done = 0;
+
+    /* 拉高 DE，切换到发送方向 */
+    HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_SET);
+
+    /* 这里可按需要加几个 bit 时间的微延时，绝大多数情况下不需要 */
+    for (volatile int i = 0; i < 100; i++) __NOP();
+
+    /* 中断发送 */
+    HAL_UART_Transmit_IT(&huart2, (uint8_t*)buf, len);
+
+    /* 若你想阻塞等发送完再返回（最小改动方案），就等标志位 */
+    while (!rs485_tx_done) {
+        /* 如果系统有 rtos/低功耗，可在此让出 CPU */
+    }
+}
+
+/* 把 printf/拼好的字符串通过 RS485 发出去的便捷函数 */
+ void RS485_Print(const char* s)
+{
+    RS485_Send_IT((const uint8_t*)s, (uint16_t)strlen(s));
+}
+
+/* === 串口回调：发送完成后务必拉回接收态 === */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        /* 发送真正完成（HAL 内部等到 TC）后回到接收态 */
+        HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET);
+        rs485_tx_done = 1;
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        /* 可在此处理收到的数据，然后继续下一次接收 */
+        HAL_UART_Receive_IT(&huart2, &rs485_rx_byte, 1);
+    }
+}
+
+
+// 适配RTOS,阻塞发送
+void RS485_Send_Block(const uint8_t *buf, uint16_t len)
+{
+    // 1. 拉高 DE，切换到发送模式
+    HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_SET);
+    
+    // 微小延时确保电平稳定
+    for(volatile int i=0; i<100; i++); 
+
+    // 2. 阻塞发送 (超时时间 100ms)
+    // 注意：这里没有用 IT 发送，因为 IT 发送需要处理 "发送完成回调" 来拉低 DE
+    // 在 RTOS 里，直接阻塞发送反而代码最少，且 921600 波特率下阻塞时间极短。
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+
+    // 3. 发送完毕，拉低 DE，切回接收模式
+    HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET);
+}
+
+// 封装一个打印字符串函数
+void RS485_Print_Str(const char* s)
+{
+    RS485_Send_Block((uint8_t*)s, strlen(s));
+}
